@@ -57,3 +57,14 @@ def set_module_path(module_name, guide='user', choose_max=True):
         print module_folder, 'already in path'
     else:
         print 'could not determine what to do'
+
+def trim_matrix(df):
+    '''
+    Takes a correlation data frame and removes all row/column
+    combinations where the correlation is np.nan. For use when
+    missing correlations mess up a cluster analysis.
+    '''
+
+    null_mask = df.apply(lambda x: x.isnull().mean()) == 0.0
+    df = df.ix[null_mask, null_mask]
+    return df
