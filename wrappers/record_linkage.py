@@ -96,7 +96,8 @@ def split_by_exact_matches(dataframe, columns, group_label='group', tag=None):
 def dataframe_linkage(records, settings, id_col=None, to_string=False,
     records_sample=0.01, training_file=None, training='append',
     settings_output=None, threshold_sample=1.0, recall_weight=1.5,
-    split_output=False, override_columns=None, verbose=True):
+    split_output=False, override_columns=None, ppc=1, uncovered_dupes=1,
+    verbose=True):
     '''
     records : data frame or list of data frames to convert to a frozen dictionary;
         columns to be used in records linkage must be consistently named across
@@ -128,6 +129,12 @@ def dataframe_linkage(records, settings, id_col=None, to_string=False,
     override_columns : a columns of list of columns that automatically trigger
         a match; if two records match on all override_columns, they are labelled
         as a match and are not processed through the dedupe algorithms
+    ppc : float between 0.0 and 1.0; the proportion of all possible pairs a 
+        predicate is allowed to cover. If a predicate puts together a fraction 
+        of possible pairs greater than ppc, it will be removed from consideration. 
+        Passed to dedupes `blockingFuncton`
+    uncovered_dupes : integer, the number of true dupes pairs in the training
+        that can fail to be placed in a block. Passed to dedupes `blockingFunction`
     verbose : boolean, indicating whether to output informative messages during
         the deduping process
 
@@ -198,7 +205,7 @@ def dataframe_linkage(records, settings, id_col=None, to_string=False,
 
     if verbose:
         print 'blocking...'
-    blocker = deduper.blockingFunction()
+    blocker = deduper.blockingFunction(ppc=ppc, uncovered_dupes=uncovered_dupes)
 
     if settings_output is not None:
         deduper.writeSettings(settings_output)
