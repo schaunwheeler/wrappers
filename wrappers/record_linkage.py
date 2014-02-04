@@ -15,6 +15,14 @@ def identical_comparator(field_1, field_2) :
     else :
         return np.nan
 
+def absolute_difference_comparator(field_1, field_2):
+    abs_diff = np.abs(field_1 - field_2)
+    return abs_diff
+
+def log1p_difference_comparator(field_1, field_2):
+    log1p_diff = np.log1p(abs(field_1 - field_2))
+    return log1p_diff
+
 # Function to convert data frame to hashable dictonary
 def dataframe_to_frozendict(df, id_col, to_string=False):
     '''
@@ -49,7 +57,7 @@ def dataframe_to_frozendict(df, id_col, to_string=False):
 def dataframe_linkage(records, settings, id_col=None, to_string=False,
     records_sample=0.01, training_file=None, training='append',
     settings_output=None, threshold_sample=1.0, recall_weight=1.5,
-    split_output=False, verbose=True):
+    split_output=False, override_columns=None, verbose=True):
     '''
     records : data frame or list of data frames to convert to a frozen dictionary;
         columns to be used in records linkage must be consistently named across
@@ -78,6 +86,9 @@ def dataframe_linkage(records, settings, id_col=None, to_string=False,
         a single data frame will be returned with a 'data_frame_id' column
         indicating which records belonged to which item of the input list; if
         only one data frame is input, this parameter will be ignored
+    override_columns : a columns of list of columns that automatically trigger
+        a match; if two records match on all override_columns, they are labelled
+        as a match and are not processed through the dedupe algorithms
     verbose : boolean, indicating whether to output informative messages during
         the deduping process
 
@@ -88,9 +99,11 @@ def dataframe_linkage(records, settings, id_col=None, to_string=False,
     deduper = dedupe.Dedupe(settings)
 
     # Convert all data frames to frozen dictionaries
+    if verbose:
+        print 'prepare data frames for linkage...'
     record_type = type(records)
     if record_type == dict:
-        input_ids = records.keys()
+        input_ids = {x:x for x in records.keys()}
     elif record_type == list:
         input_ids = range(len(records))
     else:
@@ -98,7 +111,30 @@ def dataframe_linkage(records, settings, id_col=None, to_string=False,
     for i in input_ids:
         records[i]['data_frame_id'] = input_ids[i]
 
-    records = pd.concat(records, ignore_index=True).set_index(id_col, drop=False)
+    if id_col is not None:
+        records = pd.concat(records, ignore_index=True).set_index(id_col, drop=False)
+    else:
+        records = pd.concat(records, ignore_index=True).reset_index()        
+
+    if override_columns is not None:
+        
+        if type(override_columns) == str:
+            override_columns = [override_columns]
+            
+        override_topdown = records[override_columns].apply(
+            lambda x: x.duplicated(take_last=False))
+        override_bottomup = records[override_columns].apply(
+            lambda x: x.duplicated(take_last=True))
+        override = override_topdown | override_bottomup
+        
+        duplicate_index = override.apply(np.sum, axis=1) > 0
+        
+        duplicates = records[duplicate_index]
+        records = records[~duplicate_index]
+        
+        duplicates['cluster_id'] = duplicates.groupby(
+            override_columns).grouper.group_info[0]
+        duplicates['cluster_id'] = duplicates['cluster_id'] + '_exact'
 
     record_dicts = dataframe_to_frozendict(records, id_col=id_col,
         to_string=to_string)
@@ -122,6 +158,8 @@ def dataframe_linkage(records, settings, id_col=None, to_string=False,
             if os.path.exists(training_file) & (training == 'append'):
                 deduper._initializeTraining(training_file)
 
+            if verbose:
+                print 'randomly sampling records to perform active labelling...'
             data_sample = dedupe.dataSample(record_dicts, records_sample)
 
             if verbose:
@@ -175,6 +213,9 @@ def dataframe_linkage(records, settings, id_col=None, to_string=False,
     cluster_membership.index = records.index
 
     records['cluster_id'] = cluster_membership
+    
+    if override_columns is not None:
+        records = pd.concat([records, duplicates], ignore_index=True)
 
     if split_output == True:
         if record_type == dict:
