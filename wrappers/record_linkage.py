@@ -54,6 +54,45 @@ def dataframe_to_frozendict(df, id_col, to_string=False):
     return df_d
 
 
+def split_by_exact_matches(dataframe, columns, group_label='group', tag=None):
+    '''
+    This function splits a dataframe into two dataframes - one containing
+    all records that have duplicate values on specified columns, and
+    another containing records for which there are no duplicate values.
+    
+    dataframe : the data frame to be split
+    columns : columns along which to look for duplicate values
+    group_label : the name to assign to the column containing duplicate values
+    tag : an optional tag to append to group assigments
+    
+    
+    '''
+
+    if type(columns) == str:
+        columns = [columns]
+
+    df = dataframe.copy()
+
+    topdown = df[columns].apply(
+        lambda x: x.duplicated(take_last=False))
+    bottomup = df[columns].apply(
+        lambda x: x.duplicated(take_last=True))
+    exact_matches = topdown | bottomup
+    
+    duplicate_index = exact_matches.apply(np.sum, axis=1) > 0
+    
+    duplicates = df[duplicate_index]
+    not_duplicates = df[~duplicate_index]
+    
+    duplicates[group_label] = duplicates.groupby(columns
+        ).grouper.group_info[0]
+    
+    if tag is not None:
+        duplicates.ix[:,group_label] = duplicates[group_label].apply(str) + tag
+    
+    return [duplicates, not_duplicates]
+
+
 def dataframe_linkage(records, settings, id_col=None, to_string=False,
     records_sample=0.01, training_file=None, training='append',
     settings_output=None, threshold_sample=1.0, recall_weight=1.5,
@@ -116,25 +155,9 @@ def dataframe_linkage(records, settings, id_col=None, to_string=False,
     else:
         records = pd.concat(records, ignore_index=True).reset_index()        
 
-    if override_columns is not None:
-        
-        if type(override_columns) == str:
-            override_columns = [override_columns]
-            
-        override_topdown = records[override_columns].apply(
-            lambda x: x.duplicated(take_last=False))
-        override_bottomup = records[override_columns].apply(
-            lambda x: x.duplicated(take_last=True))
-        override = override_topdown | override_bottomup
-        
-        duplicate_index = override.apply(np.sum, axis=1) > 0
-        
-        duplicates = records[duplicate_index]
-        records = records[~duplicate_index]
-        
-        duplicates['cluster_id'] = duplicates.groupby(
-            override_columns).grouper.group_info[0]
-        duplicates['cluster_id'] = duplicates['cluster_id'] + '_exact'
+    if override_columns is not None: 
+        duplicates, records = split_by_exact_matches(records, 
+            columns=override_columns, group_label='cluster_id', tag='_exact')
 
     record_dicts = dataframe_to_frozendict(records, id_col=id_col,
         to_string=to_string)
