@@ -173,14 +173,8 @@ def dataframe_linkage(records, settings, id_col=None, to_string=False,
 
         if records_sample < 1:
 
-            def factorial(number):
-                product=1
-                for i in range(number):
-                    product = product * (i+1)
-                return product
-
-            n=len(record_dicts)
-            n_combinations = factorial(n + 2 - 1)/(factorial(2)*factorial(n-1))
+            n_records = len(record_dicts)
+            n_combinations = n_records * (n_records - 1) / 2
             records_sample = int(np.ceil(n_combinations * records_sample))
 
         # Set up training data/files
