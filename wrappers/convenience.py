@@ -6,6 +6,7 @@ import sys
 import warnings
 import pandas as pd
 import numpy as np
+import itertools
 
 
 def set_module_path(module_name, guide='user', choose_max=True):
@@ -74,8 +75,8 @@ def trim_matrix(df):
     return df
 
 
-def write_dataframe(df, conn, table_name, step=None, table_key=None, 
-    table_index=None, skip_errors=True, action=['prepare', 'append'], 
+def write_dataframe(df, conn, table_name, step=None, table_key=None,
+    table_index=None, skip_errors=True, action=['prepare', 'append'],
     deconflict='dataframe', flavor='sqlite', verbose=True):
     ''' Write data frame in chunks to avoid sql connectivity issues.
 
@@ -87,21 +88,21 @@ def write_dataframe(df, conn, table_name, step=None, table_key=None,
     table_index : a dictionary of lists, where the keys identify the names of
         indices to be created, and the lists within the dictionary values
         contain the names of the columns that will make up each dictionary
-    skip_errors : boolean, indicates whether to continue the upload even if 
+    skip_errors : boolean, indicates whether to continue the upload even if
         errors occur
     action : list, whether to prepare a table for upload, upload a data frame,
         or both
     deconflict: if 'database', remove rows from database that have the same
         key as rows in the dataframe; if 'dataframe', remove rows in the data
-        frame that have the same key as rows in the database; if 'none', do 
+        frame that have the same key as rows in the database; if 'none', do
         nothing
     flavor : passed to pandas.io.sql, indicating the flavor of SQL to expect
     verbose : boolean, indicating whether to display informative progress
         messages
 
     '''
-    df = df.convert_objects(convert_numeric=True)    
-        
+    df = df.convert_objects(convert_numeric=True)
+
     if ('append' in action) and ('prepare' not in action) and deconflict != 'none':
         if verbose:
             print 'Reading "%s" table to deconflict data frame.' % table_name
@@ -114,25 +115,25 @@ def write_dataframe(df, conn, table_name, step=None, table_key=None,
             concat_statement =  '||'.join(table_key)
         else:
             concat_statement = '+'.join(table_key)
-            
+
         previous_index = pd.io.sql.read_frame(
             'SELECT %s from %s' % (concat_statement, table_name), conn).squeeze()
         new_index = df[table_key].fillna('').applymap(str).apply(
             lambda x: ''.join(x), axis=1)
-        
+
         if deconflict == 'dataframe':
             df = df[~new_index.isin(previous_index)]
         elif deconflict == 'database':
             to_remove = previous_index[previous_index.isin(new_index)].values
-            remove_statement = 'DELETE FROM %s WHERE %s IN (%s)' % (table_name, 
+            remove_statement = 'DELETE FROM %s WHERE %s IN (%s)' % (table_name,
                 concat_statement, ', '.join(to_remove))
 
             cursor = conn.cursor()
 
-            try:    
+            try:
                 cursor.execute(remove_statement)
             except conn.Error:
-                cursor.close()    
+                cursor.close()
                 cursor = conn.cursor()
                 cursor.execute(remove_statement)
             cursor.close()
@@ -141,10 +142,10 @@ def write_dataframe(df, conn, table_name, step=None, table_key=None,
         if pd.io.sql.table_exists(table_name, conn, "mysql") & verbose:
             print 'Table named "%s" already exists.' % table_name
             print 'Existing table will be replaced.\n'
-        
+
         if verbose:
             print 'Preparing query...'
-        
+
         def check_digits(series):
             if series.dtype.name in ['float64']:
                 diff = series - series.round(0)
@@ -158,103 +159,118 @@ def write_dataframe(df, conn, table_name, step=None, table_key=None,
             else:
                 out = x.apply(str).str.len().max()
             return out
-        
-        df = df.apply(check_digits)    
+
+        df = df.apply(check_digits)
         bool_cols = df.dtypes == 'bool'
         df.ix[:,bool_cols] = df.ix[:,bool_cols].apply(
-            lambda x: x.astype('int64'))    
-        
+            lambda x: x.astype('int64'))
+
         datatype_dict = {np.dtype('float64'):'FLOAT(%d)',
                          np.dtype('int64'):'INT(%d)',
-                         np.dtype('O'):'VARCHAR(%d)'}    
+                         np.dtype('O'):'VARCHAR(%d)'}
         sql_dtypes = df.dtypes.map(datatype_dict)
         col_maxlengths = df.apply(check_lengths)
-        
+
         sql_dtypes = pd.Series(
             [sql_dtypes[i] % col_maxlengths[i] for i in range(sql_dtypes.shape[0])],
-            index = sql_dtypes.index) 
-        
+            index = sql_dtypes.index)
+
         sql_dtypes = pd.DataFrame({
             'column_name': sql_dtypes.index.values,
             'data_types': sql_dtypes,
             'not_null': np.where(sql_dtypes.index.isin(table_key), 'NOT NULL', '')
-        })    
-        
+        })
+
         query = [
             'DROP TABLE IF EXISTS %s;' % table_name,
             'SHOW WARNINGS;',
              #'SET GLOBAL max_allowed_packet=1073741824;'
             'CREATE  TABLE IF NOT EXISTS %s (' % table_name]
-        
+
         for i in range(sql_dtypes.shape[0]):
             query.append(
                 '%s %s %s REFERENCES %s (%s),' % (
-                    sql_dtypes['column_name'][i], sql_dtypes['data_types'][i], 
-                    sql_dtypes['not_null'][i], table_name, 
+                    sql_dtypes['column_name'][i], sql_dtypes['data_types'][i],
+                    sql_dtypes['not_null'][i], table_name,
                     sql_dtypes['column_name'][i]))
-    
+
         query.append('created TIMESTAMP DEFAULT CURRENT_TIMESTAMP,')
         query.append('updated TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,')
-    
+
         if table_key is None:
             table_key = df.columns[0]
-    
+
         query.append('PRIMARY KEY (%s))' % ', '.join(table_key))
         query.append('CHARSET utf8 COLLATE utf8_general_ci;')
-    
-        if table_index is not None:        
+
+        if table_index is not None:
             for idx, cols in table_index.iteritems():
-                query.append('CREATE INDEX %s on %s (%s);' % (idx, table_name, 
+                query.append('CREATE INDEX %s on %s (%s);' % (idx, table_name,
                              ', '.join(cols)))
-    
+
         query.append('SHOW WARNINGS;')
-        
+
         query = ' '.join(query)
-        
+
         cursor = conn.cursor()
-            
-        try:    
+
+        try:
             cursor.execute(query)
         except conn.Error:
-            cursor.close()    
+            cursor.close()
             cursor = conn.cursor()
             cursor.execute(query)
         cursor.close()
-    
+
     if 'append' in action:
 
         df = df.where((pd.notnull(df)), None)
-        
+
         if step is None:
             step = df.shape[0] - 1
-        
+
         if verbose:
             print 'Executing query...'
-        
+
         with warnings.catch_warnings():
             warnings.simplefilter('ignore', conn.Warning)
             if verbose:
                 print 'Records (out of %d) written to database:' % (df.shape[0])
-            for i in range(0, df.shape[0], step): 
-                if skip_errors:                            
+            for i in range(0, df.shape[0], step):
+                if skip_errors:
                     try:
-                        pd.io.sql.write_frame(df[i:(i + step)], 
+                        pd.io.sql.write_frame(df[i:(i + step)],
                                               con=conn,
                                               name=table_name, if_exists='append',
                                               flavor=flavor)
                         if verbose:
-                            print np.where((i + step) < df.shape[0], (i + step), 
+                            print np.where((i + step) < df.shape[0], (i + step),
                                            df.shape[0]),
                     except conn.Error, e:
                         if verbose:
                             print "Error %d: %s" % (e.args[0], e.args[1])
-                    
+
                 else:
-                    pd.io.sql.write_frame(df[i:(i + step)], 
+                    pd.io.sql.write_frame(df[i:(i + step)],
                                               con=conn,
                                               name=table_name, if_exists='append',
                                               flavor=flavor)
                     if verbose:
-                        print np.where((i + step) < df.shape[0], (i + step), 
+                        print np.where((i + step) < df.shape[0], (i + step),
                                        df.shape[0]),
             print ''
+
+def expand_grid(x):
+    if type(x) is pd.DataFrame:
+        values = {col:list(x[col].unique()) for col in x}
+    if type(x) is dict:
+        values = {key:np.unique(value) for (key, value) in x.items()}
+    
+    columns = []
+    lst = []
+    columns += values.iterkeys()
+    lst += values.itervalues()
+    
+    output = pd.DataFrame(list(itertools.product(*lst)), columns=columns)
+
+    return output
