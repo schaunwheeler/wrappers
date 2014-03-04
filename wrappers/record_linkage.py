@@ -1,13 +1,17 @@
 #!/usr/bin/python
 # -*- coding: utf-8 -*-
 
-import os
 import pandas as pd
 import numpy as np
 import Levenshtein
+import fuzzy
+import wrappers.convenience
+import statsmodels.api
 #import dedupe
 
-def identical_diff(field_1, field_2) :
+pd.options.mode.chained_assignment = None 
+
+def identical_sim(field_1, field_2) :
     if field_1 and field_2 :
         if field_1 == field_2 :
             return 1
@@ -16,144 +20,101 @@ def identical_diff(field_1, field_2) :
     else :
         return np.nan
 
-def absolute_diff(field_1, field_2):
-    distance = np.abs(field_1 - field_2)
-    return distance
+def absolute_sim(field_1, field_2):
+    similarity = np.abs(field_1 - field_2)
+    return similarity
 
-def log1p_diff(field_1, field_2):
-    distance = np.log1p(abs(field_1 - field_2))
-    return distance
+def log1p_sim(field_1, field_2):
+    similarity = np.log1p(abs(field_1 - field_2))
+    return similarity
 
-def percent_diff(field_1, field_2):
-    distance = abs(field_1 - field_2) / field_1
-    return distance
+def percent_sim(field_1, field_2):
+    similarity = abs(field_1 - field_2) / field_1
+    return similarity
 
-def inverse_absolute_diff(field_1, field_2):
-    distance = 1 / (abs(field_1 - field_2) + 1)
-    return distance
+def inverse_absolute_sim(field_1, field_2):
+    similarity = 1 / (abs(field_1 - field_2) + 1)
+    return similarity
 
-def inverse_log1p_diff(field_1, field_2):
-    distance = 1 / (np.log1p(abs(field_1 - field_2)) + 1)
-    return distance
+def inverse_log1p_sim(field_1, field_2):
+    similarity = 1 / (np.log1p(abs(field_1 - field_2)) + 1)
+    return similarity
 
-def jarowinkler_diff(field_1, field_2):
-    distance = Levenshtein.jaro_winkler(field_1, field_2)
-    return distance
+def jarowinkler_sim(field_1, field_2):
+    similarity = Levenshtein.jaro_winkler(field_1, field_2)
+    return similarity
 
-def scaledlevenshtein_diff(field_1, field_2):
-    distance = Levenshtein.ratio(field_1, field_2)
-    return distance
+def scaledlevenshtein_sim(field_1, field_2):
+    similarity = Levenshtein.ratio(field_1, field_2)
+    return similarity
 
-def levenshtein_diff(field_1, field_2):
-    distance = Levenshtein.distance(field_1, field_2)
-    return distance
+def metaphone_sim(field_1, field_2):
+    f_1 = [fuzzy.DMetaphone()(x) for x in field_1.split(' ')]
+    f_2 = [fuzzy.DMetaphone()(x) for x in field_2.split(' ')]    
 
-identical_diffv = np.vectorize(lambda x: identical_diff(*x))
-absolute_diffv = np.vectorize(lambda x: absolute_diff(*x))
-log1p_diffv = np.vectorize(lambda x: log1p_diff(*x))
-percent_diffv = np.vectorize(lambda x: percent_diff(*x))
-inverse_absolute_diffv = np.vectorize(lambda x: inverse_absolute_diff(*x))
-inverse_log1p_diffv = np.vectorize(lambda x: inverse_log1p_diff(*x))
-jarowinkler_diffv = np.vectorize(lambda x: jarowinkler_diff(*x))
-scaledlevenshtein_diffv = np.vectorize(lambda x: scaledlevenshtein_diff(*x))
-levenshtein_diffv = np.vectorize(lambda x: levenshtein_diff(*x))
+    length = len(f_1) - len(f_2)
+    if length < 0:    
+        f_1 += ([['___1', '___2']] * np.abs(length))
+    elif length > 0:    
+        f_2 += ([['___1', '___2']] * np.abs(length))        
+    
+    f_zipped = zip(f_1, f_2)   
+    f_sets = [x+y for (x,y) in f_zipped]
 
-identical_diffv.__name__ = 'identical_diffv'
-absolute_diffv.__name__ = 'absolute_diffv'
-log1p_diffv.__name__ = 'log1p_diffv'
-percent_diffv.__name__ = 'percent_diffv'
-inverse_absolute_diffv.__name__ = 'inverse_absolute_diffv'
-inverse_log1p_diffv.__name__ = 'inverse_log1p_diffv'
-jarowinkler_diffv.__name__ = 'jarowinkler_diffv'
-scaledlevenshtein_diffv.__name__ = 'scaledlevenshtein_diffv'
-levenshtein_diffv.__name__ = 'levenshtein_diffv'
+    for i in range(len(f_sets)):
+        replacement = [x for x in f_sets[i] if x is not None]
+        if replacement == []:
+            replacement = ['None1', 'None2', 'None1', 'None2']
+        f_sets[i] = replacement
+    
+    similarities = [(len(x) - len(set(x))) / len(set(x)) for x in f_sets]
+    similarity = np.mean(similarities)
+    return similarity
 
-# Function to convert data frame to hashable dictonary
-def dataframe_to_recorddict(df, df_tag=None, id_col=None, to_string=False):
-    '''
-    df : data frame to convert to a frozen dictionary
-    df_tag : an identifier for the data frame itself, to append to id values
-    id_col : column of unique identifiers; if None (default), the data frame
-        index will be used
-    to_string : boolean, indicating whether to convert all values to type str
-
-    '''
-
-    if id_col is not None:
-        id_values = df[id_col].values
+def jaccard_sim(list_1, list_2, fillna=1):
+    
+    if (list_1 == []) & (list_2 == []):
+        similarity = fillna
     else:
-        id_values = df.reset_index().index.values
+        set_1 = set(list_1)
+        set_2 = set(list_2)
+        n = len(set_1.intersection(set_2))
+        similarity = n / float(len(set_1) + len(set_2) - n)
+    return similarity
 
-    if df_tag is not None:
-        id_values = [df_tag + str(x) for x in id_values]
+def return_same(value):
+    return value
 
-    colnames = df.columns.values
+def return_metaphone(value):
+     value = [fuzzy.DMetaphone()(x) for x in value.split(' ')]
+     value = [x for y in value for x in y if x is not None]
+     value = ''.join(value)
+     return value
 
-    df = df.fillna('')
+identical_simv = np.vectorize(lambda x: identical_sim(*x))
+absolute_simv = np.vectorize(lambda x: absolute_sim(*x))
+log1p_simv = np.vectorize(lambda x: log1p_sim(*x))
+percent_simv = np.vectorize(lambda x: percent_sim(*x))
+inverse_absolute_simv = np.vectorize(lambda x: inverse_absolute_sim(*x))
+inverse_log1p_simv = np.vectorize(lambda x: inverse_log1p_sim(*x))
+jarowinkler_simv = np.vectorize(lambda x: jarowinkler_sim(*x))
+scaledlevenshtein_simv = np.vectorize(lambda x: scaledlevenshtein_sim(*x))
+metaphone_simv = np.vectorize(lambda x: metaphone_sim(*x))
+jaccard_simv = np.vectorize(lambda x: jaccard_sim(*x))
 
-    if to_string:
-        df = df.applymap(str)
+identical_simv.__name__ = 'identical_simv'
+absolute_simv.__name__ = 'absolute_simv'
+log1p_simv.__name__ = 'log1p_simv'
+percent_simv.__name__ = 'percent_simv'
+inverse_absolute_simv.__name__ = 'inverse_absolute_simv'
+inverse_log1p_simv.__name__ = 'inverse_log1p_simv'
+jarowinkler_simv.__name__ = 'jarowinkler_simv'
+scaledlevenshtein_simv.__name__ = 'scaledlevenshtein_simv'
+metaphone_simv.__name__ = 'metaphone_simv'
+jaccard_simv.__name__ = 'jaccard_simv'
 
-    df= df.groupby(id_values)
-    df = df.apply(lambda x: dict(zip(colnames, x.values[0])))
-    df.index = [x for x in df.index.values]
-
-    df_d = df.to_dict()
-
-    return df_d
-
-
-def group_by_exact_matches(dataframe, columns, group_label='group', tag=None):
-    '''
-    Group records that are exact duplicates on specified columns.
-
-    dataframe : the data frame to be split
-    columns : columns along which to look for duplicate values
-    group_label : the name to assign to the column containing duplicate values
-    tag : an optional tag to append to group assigments
-
-
-    '''
-
-    if type(columns) == str:
-        columns = [columns]
-
-    if type(dataframe) == list:
-        df = dataframe[0].copy()
-    else:
-        df = dataframe.copy()
-
-    topdown = df[columns].apply(
-        lambda x: x.duplicated(take_last=False))
-    bottomup = df[columns].apply(
-        lambda x: x.duplicated(take_last=True))
-    exact_matches = topdown | bottomup
-
-    duplicate_index = exact_matches.apply(np.sum, axis=1) > 0
-
-    if duplicate_index.sum() > 0:
-        duplicates = df[duplicate_index]
-        not_duplicates = df[~duplicate_index]
-
-        replacements = pd.Series(
-            duplicates.groupby(columns).grouper.group_info[0],
-            index=duplicates.index)
-
-        if tag is not None:
-            replacements = replacements.apply(str) + tag
-
-        duplicates[group_label] = replacements
-
-        df = pd.concat([duplicates, not_duplicates])
-    else:
-        df[group_label] = None
-
-    return df
-
-
-def dataframe_linkage(records, settings, blocking, id_col=None, to_string=False,
-    reset_index=True, threshold=None, keep_best=True, override_columns=None, 
-    exclude_exact_matches=True, bootstrap=None, verbose=True):
+def dataframe_linkage2(records, settings, blocking, id_col=None, weights=None,
+    reset_index=True, threshold=None, keep_best=True, verbose=True):
     '''
     records : data frame or list of data frames to convert to dictionaries;
         columns to be used in records linkage must be consistently named across
@@ -162,36 +123,48 @@ def dataframe_linkage(records, settings, blocking, id_col=None, to_string=False,
         assumes a single dataframe and will label duplicates
     settings : file or dictionary containing settings to pass to dedupe module
     blocking : column or list of columns on which to block records
-    id_col: name of column containing unique identifiers (passed to
-        `dataframe_to_frozendict`); id_col, like all columns, must be consistent
-        across data frames
-    to_string : boolean, indicating whether to convert all values to type str;
-        passed to `dataframe_to_frozendict`
+    id_col: name of column containing unique identifiers; id_col, 
+        like all columns, must be consistent across data frames
     reset_index : reset index of data frames as a precaution to make sure each
         row has a unique identifier
-    threshold : float between 0.0 and 1.0 indicating cutoff point in logistic
-        regression predictons for determining matches. If None, threshold will
-        be determined algorithmically.
-    keep_best : boolean, indicating whether to keep only the best potential match
-        between two records
-    override_columns : a columns of list of columns that automatically trigger
-        a match; if two records match on all override_columns, they are labelled
-        as a match and are not processed through the dedupe algorithms
-    exclude_exact_matches : boolean, indicating whether to leave exact matches
-        from override_columns out of the records for fuzzy matching
-    bootstrap : integer, indicating how many samples to use in bootstrapping
-        mean similarity
+    threshold : float between 0.0 and 1.0 indicating cutoff point below which
+        words will not be considered matches
+    keep_best : integer, when multiple potential matches are found for a word, 
+        the top keep_best will be kept
     verbose : boolean, indicating whether to output informative messages during
         the deduping process
+
+    Process
+    _______
+    
+    1. run with threshold==0.0 and keep_best==2
+    2. Get pairs
+    3. Randomly select pairs and evaluate them
+        a. Use input plus exact matches to determine threshold
+        b. Perform logistic regression on labelled data to weight dict keys
+    4. re-run with threshold=thredhold, keep_best=True
+
 
 
     '''
     
-    settings = {keys:(values if (type(values) is list) else [values]) for 
-        (keys, values) in settings.items()}     
+    settings = dict(settings)    
     
-    if type(blocking) is not list:
-        blocking = [blocking]
+    check_dicts = np.mean([type(v)==dict for (k,v) in settings.items()])
+
+    if check_dicts==0:
+        if weights is not None:
+            for (k,v) in settings.items():
+                settings[k] = {'function':v, 'weight': weights[k][v.__name__]}
+        else:
+            settings = {k:{'function':v, 'weight':1} for (k,v) in settings.items()}
+    elif check_dicts==1:
+        weights = True
+    else:
+        raise Exception('inconsistent value types in settings dictionary')
+        
+    if type(blocking) is not dict:
+        blocking = {blocking:return_same}
         
     record_type = type(records)
     
@@ -214,40 +187,14 @@ def dataframe_linkage(records, settings, blocking, id_col=None, to_string=False,
             id_col = 'id'
             for i in range(len(records)):
                 records[i]['id'] = [str(x) for x in records[i].index]
-    
-    if override_columns is not None:
-    
-        records = pd.concat(records, keys=input_ids)
-    
-        records = group_by_exact_matches(dataframe=records,
-            columns=override_columns, group_label='cluster_id', tag='_exact')
-    
-        if exclude_exact_matches:
-            exact_dupes = records[records['cluster_id'].notnull()]
-            records = records[records['cluster_id'].isnull()]
-    
-        if len(input_ids) == 2:
-            records = [records[records.index.get_level_values(0) == x].copy()
-                for x in input_ids]
-            exact_dupes = [exact_dupes[exact_dupes.index.get_level_values(0) == x].copy()
-                for x in input_ids]
-            exact_dupes[0] = (pd.merge(exact_dupes[0], 
-                exact_dupes[1].loc[:,['cluster_id', 'id']], how='left', 
-                on='cluster_id', suffixes=('', '_match')))
-            exact_dupes[1] = (pd.merge(exact_dupes[1], 
-                exact_dupes[0].loc[:,['cluster_id', 'id']], how='left', 
-                on='cluster_id', suffixes=('', '_match')))
-
-        else:
-            records = [records]
-            exact_dupes = [exact_dupes]
-        
+            
     for i in range(len(records)):
-        records[i] = records[i].drop(['cluster_id'], axis=1)
-        blocker = records[i][blocking]
+        blocker = records[i][blocking.keys()]
         records[i].columns = records[i].columns.values + input_ids[i]
 
-    
+        for key in blocking.keys():
+            blocker[key] = blocker[key].apply(blocking[key]).copy()
+        
         if blocker.shape[1] > 1:
             records[i]['blocker'] = blocker.fillna('').applymap(str).apply(
                 lambda x: ''.join(x), axis=1)
@@ -276,38 +223,19 @@ def dataframe_linkage(records, settings, blocking, id_col=None, to_string=False,
         results = temp_records[id_columns]
 
         for col in target_columns:
-            wanted_cols = [x for x in temp_records.columns if x.startswith(col)]
+            wanted_cols = [col+x for x in input_ids]
             pairs = temp_records[wanted_cols].to_records(index=False)
-            for fun in settings[col]:
-                colname = col + '__' + fun.__name__
-                results[colname] = fun(pairs)
+            colname = col + '__' + settings[col]['function'].__name__
+            results[colname] = settings[col]['function'](pairs)
             if verbose:
                 print '%d ' % (target_columns.index(col) + 1),
         
-        if bootstrap is None:
-            means = results.set_index(id_columns).mean(axis=1).reset_index(
-                drop=True)
-        elif bootstrap == 'jackknife':
-            boot_df = results.set_index(id_columns)
-            means = []
-            all_cols = boot_df.columns.values
-            
-            for col in all_cols:
-                jack_cols = [x for x in all_cols if x != col]
-                jack_means = boot_df[jack_cols].mean(axis=1).reset_index(drop=True)
-                means.append(jack_means)
-            means = pd.concat(means, axis=1).mean(axis=1)
-        else:
-            boot_df = results.set_index(id_columns)
-            means = []
-            all_cols = boot_df.columns.values
-            n_cols = len(all_cols)            
-
-            for i in range(bootstrap):
-                boot_cols = np.random.choice(all_cols, size=n_cols, replace=True)
-                boot_means = boot_df[boot_cols].mean(axis=1).reset_index(drop=True)
-                means.append(boot_means)
-            means = pd.concat(means, axis=1).mean(axis=1)
+        weights_list = [x['weight'] for x in settings.values()]
+        column_order = [k + '__' + v['function'].__name__ for (k,v) in settings.items()]
+        means = results.set_index(id_columns)[column_order]
+        means = means * weights_list
+        means = means.sum(axis=1) / sum(weights_list)
+        means = means.reset_index(drop=True)
         
         results['mean_similarity'] = means
 
@@ -317,21 +245,21 @@ def dataframe_linkage(records, settings, blocking, id_col=None, to_string=False,
             results = results[keeps]
         
         if keep_best:
-           results = results.sort(columns='mean_similarity', ascending=False)
-           results = results.groupby(id_columns[0]).first().reset_index()
-           results = results.sort(columns='mean_similarity', ascending=False)
-           results = results.groupby(id_columns[1]).first().reset_index()
+            
+            results = results.sort(columns='mean_similarity', ascending=False)
+            results = results.groupby(id_columns[0], as_index=False).head(keep_best)
+
+            results = results.sort(columns='mean_similarity', ascending=False)
+            results = results.groupby(id_columns[1], as_index=False).head(keep_best)
 
         matched_df = matched_df.append(results, ignore_index=True)
         print ''
 
     matched_df['cluster_id'] = range(matched_df.shape[0])
-    keep_columns = id_columns + ['cluster_id', 'mean_similarity']
-    dupes = matched_df[keep_columns]
 
-    records[0] = pd.merge(records[0], dupes, how='left', on=id_columns[0])
-    records[1] = pd.merge(records[1], dupes, how='left', on=id_columns[1])
-    
+    records[0] = pd.merge(records[0], matched_df, how='left', on=id_columns[0])
+    records[1] = pd.merge(records[1], matched_df, how='left', on=id_columns[1])
+        
     records[0] = records[0].rename(columns={id_columns[0]: id_col, 
         id_columns[1]: id_col+'_match'})
     records[1] = records[1].rename(columns={id_columns[1]: id_col, 
@@ -341,10 +269,6 @@ def dataframe_linkage(records, settings, blocking, id_col=None, to_string=False,
         records[0].columns]
     records[1].columns = [x.replace(input_ids[1], '') for x in 
         records[1].columns]
-
-    if (override_columns is not None) & exclude_exact_matches:
-        records[0] = pd.concat([records[0], exact_dupes[0]], ignore_index=True)
-        records[1] = pd.concat([records[1], exact_dupes[1]], ignore_index=True)
     
     start_cols = [id_col, id_col+'_match', 'cluster_id', 'blocker', 'mean_similarity']
     other_cols = [x for x in records[0].columns if x not in start_cols]    
@@ -357,40 +281,455 @@ def dataframe_linkage(records, settings, blocking, id_col=None, to_string=False,
     
     return records
 
-def get_pairs(df1, df2, id_col, match_col, comparison_cols, metric_col=None,
-              how='inner'):
 
-    if metric_col is None:
-        metric_col = []
+def dataframe_linkage(records, settings, blocking, id_col=None, weights=None,
+    reset_index=True, threshold=None, keep_best=True, verbose=True):
+    '''
+    records : data frame or list of data frames to convert to dictionaries;
+        columns to be used in records linkage must be consistently named across
+        data frames; if a list or dictionary or two dataframes is passed to
+        records, the two dataframes will be linked. Otherwise, the function
+        assumes a single dataframe and will label duplicates
+    settings : file or dictionary containing settings to pass to dedupe module
+    blocking : column or list of columns on which to block records
+    id_col: name of column containing unique identifiers; id_col, 
+        like all columns, must be consistent across data frames
+    reset_index : reset index of data frames as a precaution to make sure each
+        row has a unique identifier
+    threshold : float between 0.0 and 1.0 indicating cutoff point below which
+        words will not be considered matches
+    keep_best : integer, when multiple potential matches are found for a word, 
+        the top keep_best will be kept
+    verbose : boolean, indicating whether to output informative messages during
+        the deduping process
+
+    Process
+    _______
+    
+    1. run with threshold==0.0 and keep_best==2
+    2. Get pairs
+    3. Randomly select pairs and evaluate them
+        a. Use input plus exact matches to determine threshold
+        b. Perform logistic regression on labelled data to weight dict keys
+    4. re-run with threshold=thredhold, keep_best=True
+
+
+
+    '''
+    
+    settings = dict(settings)    
+    
+    check_dicts = np.mean([type(v)==dict for (k,v) in settings.items()])
+
+    if check_dicts==0:
+        if weights is not None:
+            for (k,v) in settings.items():
+                settings[k] = {'function':v, 'weight': weights[k][v.__name__]}
+        else:
+            settings = {k:{'function':v, 'weight':1} for (k,v) in settings.items()}
+    elif check_dicts==1:
+        weights = True
     else:
-        metric_col = [metric_col]
-
-    df1_nomatch = df1[df1[match_col].isnull()]
-    df2_nomatch = df2[df2[match_col].isnull()]
+        raise Exception('inconsistent value types in settings dictionary')
         
-    df1 = df1[df1[match_col].notnull()]
-    df2 = df2[df2[match_col].notnull()]
+    if type(blocking) is not dict:
+        blocking = {blocking:return_same}
+        
+    record_type = type(records)
     
-    df1 = df1.sort(columns=match_col)
-    df2 = df2.sort(columns=id_col)
+    if verbose:
+        print 'preparing records for linkage...'
     
-    df1 = df1[[match_col] + comparison_cols]
-    df2 = df2[[id_col, match_col] + comparison_cols + metric_col]
+    if record_type == dict:
+        input_ids = ['_'+(x) for x in records.keys()]
+        records = [x for x in records.values()]
+    elif record_type == list:
+        input_ids = ['_first', '_second']
+    elif record_type == pd.DataFrame:
+        input_ids = [None]
+        records = [records]
 
-    df1_nomatch = df1_nomatch[[match_col] + comparison_cols]
-    df2_nomatch = df2_nomatch[[id_col, match_col] + comparison_cols + metric_col]
-
-    df1 = pd.concat([df1, df1_nomatch], ignore_index=True)
-    df2 = pd.concat([df2, df2_nomatch], ignore_index=True)
+    if reset_index:
+        records = [x.reset_index(drop=True) for x in records]
     
-    output = pd.merge(df1, df2, how=how, left_on=match_col, right_on=id_col, 
-        suffixes=('_2', '_1'))
+        if id_col is None:
+            id_col = 'id'
+            for i in range(len(records)):
+                records[i]['id'] = [str(x) for x in records[i].index]
+            
+    for i in range(len(records)):
+        blocker = records[i][blocking.keys()]
+        records[i].columns = records[i].columns.values + input_ids[i]
 
-    output = output.drop([id_col], axis=1)
+        for key in blocking.keys():
+            blocker[key] = blocker[key].apply(blocking[key]).copy()
+        
+        if blocker.shape[1] > 1:
+            records[i]['blocker'] = blocker.fillna('').applymap(str).apply(
+                lambda x: ''.join(x), axis=1)
+        else:
+            records[i]['blocker'] = blocker.squeeze()
+    
+    blocker = set.intersection(*[set(x['blocker'].unique()) for x in records])
+    blocker = list(blocker)
+    
+    matched_df = pd.DataFrame()
+    
+    if verbose:
+        print 'matching in progress...'
+    
+    target_columns = settings.keys()
+    
+    for block in blocker:
+        if verbose:
+            print 'processing block %d of %d - columns (out of %d) completed:' % (
+                blocker.index(block) + 1, len(blocker), len(target_columns)) 
+        temp_records = [x[x['blocker']==block].copy() for x in records]
+        temp_records = pd.merge(temp_records[0], temp_records[1], 
+            how='outer', on ='blocker', suffixes = input_ids) 
+        temp_cols = temp_records.columns
+        id_columns = [x for x in temp_cols if x.startswith(id_col)]
+        results = temp_records[id_columns]
+
+        for col in target_columns:
+            wanted_cols = [col+x for x in input_ids]
+            pairs = temp_records[wanted_cols].to_records(index=False)
+            colname = col + '__' + settings[col]['function'].__name__
+            results[colname] = settings[col]['function'](pairs)
+            if verbose:
+                print '%d ' % (target_columns.index(col) + 1),
+        
+        weights_list = [x['weight'] for x in settings.values()]
+        column_order = [k + '__' + v['function'].__name__ for (k,v) in settings.items()]
+        means = results.set_index(id_columns)[column_order]
+        means = means * weights_list
+        means = means.sum(axis=1) / sum(weights_list)
+        means = means.reset_index(drop=True)
+        
+        results['mean_similarity'] = means
+
+        if threshold is not None:        
+            
+            keeps = (means > threshold).values
+            results = results[keeps]
+        
+        if keep_best:
+            
+            results = results.sort(columns='mean_similarity', ascending=False)
+            results = results.groupby(id_columns[0], as_index=False).head(keep_best)
+
+            results = results.sort(columns='mean_similarity', ascending=False)
+            results = results.groupby(id_columns[1], as_index=False).head(keep_best)
+
+        matched_df = matched_df.append(results, ignore_index=True)
+        print ''
+
+    matched_df['cluster_id'] = range(matched_df.shape[0])
+
+    records[0] = pd.merge(records[0], matched_df, how='left', on=id_columns[0])
+    records[1] = pd.merge(records[1], matched_df, how='left', on=id_columns[1])
+        
+    records[0] = records[0].rename(columns={id_columns[0]: id_col, 
+        id_columns[1]: id_col+'_match'})
+    records[1] = records[1].rename(columns={id_columns[1]: id_col, 
+        id_columns[0]: id_col+'_match'})
+
+    records[0].columns = [x.replace(input_ids[0], '') for x in 
+        records[0].columns]
+    records[1].columns = [x.replace(input_ids[1], '') for x in 
+        records[1].columns]
+    
+    start_cols = [id_col, id_col+'_match', 'cluster_id', 'blocker', 'mean_similarity']
+    other_cols = [x for x in records[0].columns if x not in start_cols]    
+    column_order = start_cols + other_cols    
+    records = [x[column_order] for x in records]
+    
+    if record_type == dict:
+        records = {input_ids[i].replace('_', ''):records[i] for i in 
+            range(len(input_ids))}
+    
+    return records
+
+def get_pairs(df1, df2, id_col, match_col, comparison_cols, metric_cols=None,
+              append_nomatches=True, flag_matches=None):
+
+    if metric_cols is None:
+        metric_cols = []
+    elif type(metric_cols) is str:
+        metric_cols = [metric_cols]
+
+    df1_comparison = df1[[id_col] + comparison_cols]
+    df2_comparison = df2[[id_col] + comparison_cols]
+
+    if append_nomatches:    
+        df1_nomatch = df1[df1[match_col].isnull()]
+        df2_nomatch = df2[df2[match_col].isnull()]
+        
+    df = df2[df2[match_col].notnull()]
+    df = df.sort(columns=id_col)
+    df = df[[id_col, match_col] + metric_cols]
+
+    df = pd.merge(df, df2_comparison, how='left', left_on=id_col, 
+        right_on=id_col)
+    df = df.rename(columns={id_col:id_col+'_original'})
+    df = pd.merge(df, df1_comparison, how='left', left_on=match_col, 
+        right_on=id_col, suffixes=('', '_match'))
+    df = df.drop([id_col], axis=1)
+    df = df.rename(columns={id_col+'_original':id_col})
+    df = df.drop_duplicates(cols=[id_col, match_col])
+    
+    if append_nomatches:
+        df1_nomatch = df1_nomatch[[id_col, match_col]]
+        df2_nomatch = df2_nomatch[[id_col, match_col]]
+        df2_nomatch = df2_nomatch.rename(columns={id_col:match_col, match_col:id_col})
+    
+        df = pd.concat([df, df1_nomatch, df2_nomatch], ignore_index=True)
+    
+    col_order = [id_col, match_col] + metric_cols + comparison_cols + \
+        [x + '_match' for x in comparison_cols]
+        
+    df = df[col_order]
+
+    if flag_matches is not None:
+        df['true_match'] = np.nan
+        df['true_match'][df[flag_matches]==1] = 1.0
+        true_match_ids = df['id'][df[flag_matches]==1]
+        false_matches = (df[flag_matches]!=1) & df['id'].isin(true_match_ids)
+        df['true_match'][false_matches] = 0.0
+
+    return df
+
+def tune_linkage(data, output_col, train_cols, k, similarity_metric, 
+    naive_prediction=None, recall_cutoff=.95, boot=250):
+
+    folds = np.random.choice(k,data.shape[0])
+    errors = []
+    weights = pd.DataFrame()
+    predictions = pd.DataFrame()
+    
+    for fold in sorted(np.unique(folds)):
+        y_train = data[output_col][folds!=fold]
+        x_train = data[train_cols][folds!=fold]
+        x_test = data[train_cols][folds==fold]
+        y_test = data[output_col][folds==fold]
+        
+        value_counts = y_train.value_counts()
+        if len(value_counts)>2:
+            print 'fold does not contain both true and false matches'
+    
+        logit = statsmodels.api.Logit(y_train, x_train)
+        result = logit.fit()
+        weights = pd.concat([weights, result.params.sort_index().to_frame().T], 
+            ignore_index=True)
+    
+        if naive_prediction is None:
+            naive_prediction = value_counts.max() / value_counts.sum()
+    
+        model_prediction = result.predict(x_test)
+        
+        predicts = pd.DataFrame({'original_data':y_test.values, 
+            'model_predictions':model_prediction,
+            'similarity':data[similarity_metric][folds==fold]})
+        predicts['naive_predicton'] = naive_prediction
+        predicts['fold'] = fold
+        
+        predictions = pd.concat([predictions, predicts], ignore_index=True)
+        
+        model_error = wrappers.convenience.mase(model_prediction, y_test, 
+             func=lambda z: np.mean(np.abs(z - naive_prediction)))
+        errors.append(model_error)
+    
+    mean_weights = weights[train_cols].apply(
+        lambda x: np.abs(np.average(x, weights=errors)), axis=0)
+    mean_weights = mean_weights.to_dict()
+    mean_weights = {k.split('__')[0]:{k.split('__')[1]:v} for (k,v) 
+        in mean_weights.items()}
+        
+    fps = predictions[predictions['similarity']!=1.0]['similarity']
+    fps_shape = fps.shape[0]
+    boot_samples = []
+    for i in range(boot):
+        sampled = fps.iloc[np.random.choice(fps_shape, fps_shape)]
+        sampled = sampled.quantile(recall_cutoff)
+        boot_samples.append(sampled)
+    
+    threshold = np.mean(boot_samples)
+
+    class results():
+        def __init__(self, weights, mean_weights, errors, predictions, threshold):
+            self.weights=weights
+            self.mean_weights=mean_weights
+            self.errors=errors
+            self.predictions=predictions
+            self.threshold=threshold
+    
+    output = results(weights, mean_weights, errors, predictions, threshold)
 
     return output
 
 
+def matched_preprocessing(df1, df2, group_cols, index_cols, threshold=None,
+    k=1, combine=False):
+
+    data1 = df1.copy()
+    data2 = df2.copy()
+    
+    other_cols = [x for x in data1.columns if x not in (group_cols+index_cols)]
+    data1 = data1.set_index(index_cols+group_cols)
+    data2 = data2.set_index(index_cols+group_cols)
+    
+    data1 = data1.unstack(group_cols)
+    data2 = data2.unstack(group_cols)
+    
+    final = pd.DataFrame(data=0.0, columns=data1.columns.droplevel(0).unique(),
+        index=data2.columns.droplevel(0).unique())
+    
+    for x in other_cols:
+        print x
+        mat1 = data1.ix[:,data1.columns.get_level_values(0)==x]
+        mat2 = data2.ix[:,data2.columns.get_level_values(0)==x]
+        output = pd.DataFrame(data=0.0, columns=mat1.columns, index=mat2.columns)
+        weights = pd.Series(data=0.0, index=mat2.columns)
+        for lev in mat1.columns:
+            print len(mat1.columns.values) - list(mat1.columns.values).index(lev),
+            weights += (mat1[lev].notnull().mean() * mat2.notnull().mean())
+            corrs = (mat2.corrwith(mat1[lev]).abs() * weights)
+            corrs = corrs.fillna(0)
+            output.loc[:,lev] = corrs
+        output = output.div(weights, axis='index')
+        output.columns = output.columns.droplevel(0)
+        output.index = output.index.droplevel(0)
+        final += output
+        print ' '
+    
+    final = (final / len(other_cols))
+    final.index = pd.MultiIndex.from_tuples(final.index, names=group_cols)
+    final.columns = pd.MultiIndex.from_tuples(final.columns, names=group_cols)
+    
+    final = final.stack(group_cols)
+    final.name = 'value'
+    match_cols = [x+'_match' for x in group_cols]
+    final.index.names = match_cols + group_cols
+    final = final.reset_index()
+    
+    final = final.sort(columns=['value'], ascending=False).reset_index(drop=True)
+    
+    if threshold is not None:
+        final = final[final['value']>threshold]
+    
+    if k is not None:
+        hash_table = final[group_cols].drop_duplicates()
+        
+        for it in range(k):
+            print 'iteration: %d' % (it+1)
+            for i in range(hash_table.shape[0]):
+                print hash_table.shape[0] - range(hash_table.shape[0]).index(i),  
+                flag = (final[group_cols] == hash_table.iloc[i,:])
+                flag = flag.sum(axis=1) == len(group_cols)
+                match_flag = pd.Series([(x,y) for x,y in final[match_cols].values])
+                match_flag = match_flag.isin(
+                    [(x,y) for x,y in final.ix[flag, match_cols].head(it+1).values])
+                flag_first = (flag.index[flag])[:(it+1)]
+                flag_first = ~flag.index.isin(flag_first)
+                final = final[~(match_flag.values & flag_first)]
+                print ''
+        
+        final = final.groupby(group_cols).head(k)
+        final = final.reset_index(drop=True)
+    
+        if combine:
+            data1 = data1.stack(group_cols).reset_index()
+            data2 = data2.stack(group_cols).reset_index()
+            data2_values = pd.Series([(x,y) for x,y in data2[group_cols].values])
+            matched_values = [(x,y) for x,y in final[match_cols].values]
+            data2 = data2[data2_values.isin(matched_values)]
+            final = pd.concat([data1, data2])
+    
+    return final
+
+# Function to convert data frame to hashable dictonary
+#def dataframe_to_recorddict(df, df_tag=None, id_col=None, to_string=False):
+#    '''
+#    df : data frame to convert to a frozen dictionary
+#    df_tag : an identifier for the data frame itself, to append to id values
+#    id_col : column of unique identifiers; if None (default), the data frame
+#        index will be used
+#    to_string : boolean, indicating whether to convert all values to type str
+#
+#    '''
+#
+#    if id_col is not None:
+#        id_values = df[id_col].values
+#    else:
+#        id_values = df.reset_index().index.values
+#
+#    if df_tag is not None:
+#        id_values = [df_tag + str(x) for x in id_values]
+#
+#    colnames = df.columns.values
+#
+#    df = df.fillna('')
+#
+#    if to_string:
+#        df = df.applymap(str)
+#
+#    df= df.groupby(id_values)
+#    df = df.apply(lambda x: dict(zip(colnames, x.values[0])))
+#    df.index = [x for x in df.index.values]
+#
+#    df_d = df.to_dict()
+#
+#    return df_d
+#
+#
+#def group_by_exact_matches(dataframe, columns, group_label='group', tag=None):
+#    '''
+#    Group records that are exact duplicates on specified columns.
+#
+#    dataframe : the data frame to be split
+#    columns : columns along which to look for duplicate values
+#    group_label : the name to assign to the column containing duplicate values
+#    tag : an optional tag to append to group assigments
+#
+#
+#    '''
+#
+#    if type(columns) == str:
+#        columns = [columns]
+#
+#    if type(dataframe) == list:
+#        df = dataframe[0].copy()
+#    else:
+#        df = dataframe.copy()
+#
+#    topdown = df[columns].apply(
+#        lambda x: x.duplicated(take_last=False))
+#    bottomup = df[columns].apply(
+#        lambda x: x.duplicated(take_last=True))
+#    exact_matches = topdown | bottomup
+#
+#    duplicate_index = exact_matches.apply(np.sum, axis=1) > 0
+#
+#    if duplicate_index.sum() > 0:
+#        duplicates = df[duplicate_index]
+#        not_duplicates = df[~duplicate_index]
+#
+#        replacements = pd.Series(
+#            duplicates.groupby(columns).grouper.group_info[0],
+#            index=duplicates.index)
+#
+#        if tag is not None:
+#            replacements = replacements.apply(str) + tag
+#
+#        duplicates[group_label] = replacements
+#
+#        df = pd.concat([duplicates, not_duplicates])
+#    else:
+#        df[group_label] = None
+#
+#    return df
+#
+#
 # def dataframe_linkage(records, settings, id_col=None, to_string=False,
 #     reset_index=True, records_sample=0.01, training_file=None, training='append',
 #     settings_output=None, threshold=None, recall_weight=1.5,

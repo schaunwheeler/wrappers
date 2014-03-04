@@ -149,7 +149,7 @@ def write_dataframe(df, conn, table_name, step=None, table_key=None,
         def check_digits(series):
             if series.dtype.name in ['float64']:
                 diff = series - series.round(0)
-                if np.nanmax(diff) == 0.0:
+                if diff.max() == 0.0:
                     series = series.fillna(0.0).astype('int64')
             return series
 
@@ -198,7 +198,7 @@ def write_dataframe(df, conn, table_name, step=None, table_key=None,
         query.append('updated TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,')
 
         if table_key is None:
-            table_key = df.columns[0]
+            table_key = [df.columns[0]]
 
         query.append('PRIMARY KEY (%s))' % ', '.join(table_key))
         query.append('CHARSET utf8 COLLATE utf8_general_ci;')
@@ -227,7 +227,7 @@ def write_dataframe(df, conn, table_name, step=None, table_key=None,
         df = df.where((pd.notnull(df)), None)
 
         if step is None:
-            step = df.shape[0] - 1
+            step = df.shape[0]
 
         if verbose:
             print 'Executing query...'
@@ -273,4 +273,97 @@ def expand_grid(x):
     
     output = pd.DataFrame(list(itertools.product(*lst)), columns=columns)
 
+    return output
+
+def int_to_word(num,join=True):
+    '''words = {} convert an integer number into words'''
+    units = ['','one','two','three','four','five','six','seven','eight','nine']
+    teens = ['','eleven','twelve','thirteen','fourteen','fifteen','sixteen', \
+             'seventeen','eighteen','nineteen']
+    tens = ['','ten','twenty','thirty','forty','fifty','sixty','seventy', \
+            'eighty','ninety']
+    thousands = ['','thousand','million','billion','trillion','quadrillion', \
+                 'quintillion','sextillion','septillion','octillion', \
+                 'nonillion','decillion','undecillion','duodecillion', \
+                 'tredecillion','quattuordecillion','sexdecillion', \
+                 'septendecillion','octodecillion','novemdecillion', \
+                 'vigintillion']
+    words = []
+    if num==0: words.append('zero')
+    else:
+        numStr = '%d'%num
+        numStrLen = len(numStr)
+        groups = (numStrLen+2)//3
+        numStr = numStr.zfill(groups*3)
+        for i in range(0,groups*3,3):
+            h,t,u = int(numStr[i]),int(numStr[i+1]),int(numStr[i+2])
+            g = groups-(i//3+1)
+            if h>=1:
+                words.append(units[h])
+                words.append('hundred')
+            if t>1:
+                words.append(tens[t])
+                if u>=1: words.append(units[u])
+            elif t==1:
+                if u>=1: words.append(teens[u])
+                else: words.append(tens[t])
+            else:
+                if u>=1: words.append(units[u])
+            if (g>=1) and ((h+t+u)>0): words.append(thousands[g]+',')
+    if join: return ' '.join(words)
+    return words
+
+
+def word_to_int(textnum, numwords={}):
+    if not numwords:
+      units = [
+        "zero", "one", "two", "three", "four", "five", "six", "seven", "eight",
+        "nine", "ten", "eleven", "twelve", "thirteen", "fourteen", "fifteen",
+        "sixteen", "seventeen", "eighteen", "nineteen",
+      ]
+
+      tens = ["", "", "twenty", "thirty", "forty", "fifty", "sixty", "seventy", "eighty", "ninety"]
+
+      scales = ["hundred", "thousand", "million", "billion", "trillion"]
+
+      numwords["and"] = (1, 0)
+      for idx, word in enumerate(units):    numwords[word] = (1, idx)
+      for idx, word in enumerate(tens):     numwords[word] = (1, idx * 10)
+      for idx, word in enumerate(scales):   numwords[word] = (10 ** (idx * 3 or 2), 0)
+
+    current = result = 0
+    textnum = textnum.replace(',', '')
+    for word in textnum.split():
+        if word not in numwords:
+          raise Exception("Illegal word: " + word)
+
+        scale, increment = numwords[word]
+        current = current * scale + increment
+        if scale > 100:
+            result += current
+            current = 0
+
+    return result + current
+
+def ensure_dir(f):
+        d = os.path.dirname(f)
+        if not os.path.exists(d):
+            os.makedirs(d)
+
+def mase(preds, original, grouping=None, func=None):
+    if func is None:
+        func = lambda z: np.mean(np.abs(np.mean(z) - z))
+
+    absolute_error = np.abs(preds - original)
+
+    if grouping is not None:
+        naive_mae = pd.Series(original).groupby(grouping).transform(func).values
+    else:
+        naive_mae = func(original)
+
+    ase = absolute_error / naive_mae
+    ase[ase==np.inf] = np.nan
+    ase[ase==-np.inf] = np.nan
+    ase = ase[~np.isnan(ase)]
+    output = np.mean(ase)
     return output
