@@ -584,7 +584,7 @@ def matched_preprocessing(df1, group_cols, index_cols, df2=None, split_col=None,
     else:
         raise Exception('df2 can be None or split_col can be None, but not both')
             
-    other_cols = [x for x in data1.columns if x not in (group_cols+index_cols)]
+    
     data1 = data1.set_index(index_cols+group_cols)
     data2 = data2.set_index(index_cols+group_cols)
     
@@ -594,9 +594,20 @@ def matched_preprocessing(df1, group_cols, index_cols, df2=None, split_col=None,
     if split_col is not None:
         data1 = data1.drop([split_col], axis=1)
         data2 = data2.drop([split_col], axis=1)
-        
+    
+    other_cols = [x for x in df1.columns if x not in 
+        (group_cols+index_cols+[split_col])]
+    
     final = pd.DataFrame(data=0.0, columns=data1.columns.droplevel(0).unique(),
         index=data2.columns.droplevel(0).unique())
+    
+    check_types = df1[other_cols].dtypes
+    check_types = (check_types==float) | (check_types==int)
+
+    if np.mean(check_types) != 1.0:
+        print 'The following columns might not be numeric:'
+        for warn in check_types.index[~check_types]:
+            print '   ', warn
     
     if verbose:
         print 'calculating correlations'    
@@ -637,14 +648,17 @@ def matched_preprocessing(df1, group_cols, index_cols, df2=None, split_col=None,
     final = final.sort(columns=['value'], ascending=False).reset_index(drop=True)
     
     if threshold is not None:
+        if verbose:
+            print 'omitting matches below threshold'
+        
         final = final[final['value']>threshold]
     
     if k is not None:
         if verbose:
             print 'identifying nearest neighbors'
-        hash_table = final[group_cols].drop_duplicates()
         
         for it in range(k):
+            hash_table = final[group_cols].drop_duplicates()
             if verbose:
                 print 'iteration: %d' % (it+1)
             for i in range(hash_table.shape[0]):
@@ -664,21 +678,23 @@ def matched_preprocessing(df1, group_cols, index_cols, df2=None, split_col=None,
         final = final.groupby(group_cols).head(k)
         final = final.reset_index(drop=True)
     
-        if combine:
-            if verbose:
-                print 'combining data sets'
-            
-            if split_col is not None:
-                data1[split_col] = splits.index[1]
-                data2[split_col] = splits.index[0]
+    if combine:
+        if verbose:
+            print 'combining data sets'
+        
+        data1 = data1.stack(group_cols).reset_index()
+        data2 = data2.stack(group_cols).reset_index()
+        data2_values = [x for x in data2[group_cols].to_records(index=False).tolist()]
+        data2_values = pd.Series(data2_values)
+        matched_values = [x for x in final[match_cols].to_records(index=False).tolist()]
+        data2 = data2[data2_values.isin(matched_values)]
 
-            data1 = data1.stack(group_cols).reset_index()
-            data2 = data2.stack(group_cols).reset_index()
-            data2_values = pd.Series([(x,y) for x,y in data2[group_cols].values])
-            matched_values = [(x,y) for x,y in final[match_cols].values]
-            data2 = data2[data2_values.isin(matched_values)]
-            final = pd.concat([data1, data2])
-    
+        if split_col is not None:
+            data1[split_col] = splits.index[1]
+            data2[split_col] = splits.index[0]
+
+        final = pd.concat([data1, data2], ignore_index=True)
+
     return final
 
 # Function to convert data frame to hashable dictonary
