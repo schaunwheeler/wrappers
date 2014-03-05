@@ -569,7 +569,7 @@ def tune_linkage(data, output_col, train_cols, k, similarity_metric,
 
 
 def matched_preprocessing(df1, df2, group_cols, index_cols, threshold=None,
-    k=1, combine=False):
+    k=1, combine=False, verbose=False):
 
     data1 = df1.copy()
     data2 = df2.copy()
@@ -584,14 +584,19 @@ def matched_preprocessing(df1, df2, group_cols, index_cols, threshold=None,
     final = pd.DataFrame(data=0.0, columns=data1.columns.droplevel(0).unique(),
         index=data2.columns.droplevel(0).unique())
     
+    if verbose:
+        print 'calculating correlations'    
+    
     for x in other_cols:
-        print x
+        if verbose:
+            print x
         mat1 = data1.ix[:,data1.columns.get_level_values(0)==x]
         mat2 = data2.ix[:,data2.columns.get_level_values(0)==x]
         output = pd.DataFrame(data=0.0, columns=mat1.columns, index=mat2.columns)
         weights = pd.Series(data=0.0, index=mat2.columns)
         for lev in mat1.columns:
-            print len(mat1.columns.values) - list(mat1.columns.values).index(lev),
+            if verbose:
+                print len(mat1.columns.values) - list(mat1.columns.values).index(lev),
             weights += (mat1[lev].notnull().mean() * mat2.notnull().mean())
             corrs = (mat2.corrwith(mat1[lev]).abs() * weights)
             corrs = corrs.fillna(0)
@@ -600,7 +605,8 @@ def matched_preprocessing(df1, df2, group_cols, index_cols, threshold=None,
         output.columns = output.columns.droplevel(0)
         output.index = output.index.droplevel(0)
         final += output
-        print ' '
+        if verbose:
+            print ' '
     
     final = (final / len(other_cols))
     final.index = pd.MultiIndex.from_tuples(final.index, names=group_cols)
@@ -618,12 +624,16 @@ def matched_preprocessing(df1, df2, group_cols, index_cols, threshold=None,
         final = final[final['value']>threshold]
     
     if k is not None:
+        if verbose:
+            print 'identifying nearest neighbors'
         hash_table = final[group_cols].drop_duplicates()
         
         for it in range(k):
-            print 'iteration: %d' % (it+1)
+            if verbose:
+                print 'iteration: %d' % (it+1)
             for i in range(hash_table.shape[0]):
-                print hash_table.shape[0] - range(hash_table.shape[0]).index(i),  
+                if verbose:
+                    print hash_table.shape[0] - range(hash_table.shape[0]).index(i),  
                 flag = (final[group_cols] == hash_table.iloc[i,:])
                 flag = flag.sum(axis=1) == len(group_cols)
                 match_flag = pd.Series([(x,y) for x,y in final[match_cols].values])
@@ -632,12 +642,15 @@ def matched_preprocessing(df1, df2, group_cols, index_cols, threshold=None,
                 flag_first = (flag.index[flag])[:(it+1)]
                 flag_first = ~flag.index.isin(flag_first)
                 final = final[~(match_flag.values & flag_first)]
-                print ''
+                if verbose:
+                    print ''
         
         final = final.groupby(group_cols).head(k)
         final = final.reset_index(drop=True)
     
         if combine:
+            if verbose:
+                print 'combining data sets'
             data1 = data1.stack(group_cols).reset_index()
             data2 = data2.stack(group_cols).reset_index()
             data2_values = pd.Series([(x,y) for x,y in data2[group_cols].values])
