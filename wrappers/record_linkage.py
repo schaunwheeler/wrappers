@@ -577,7 +577,7 @@ def matched_preprocessing(df1, group_cols, index_cols, df2=None, split_col=None,
     elif split_col is not None:
         splits = df1[split_col].value_counts()
         if splits.shape[0]==2:
-            data1 = df1[df1[split_col]==splits.index[1]].copy()   
+            data1 = df1[df1[split_col]==splits.index[1]].copy()
             data2 = df1[df1[split_col]==splits.index[0]].copy()
         else:
             raise Exception('function can only match two data sets')
@@ -591,6 +591,10 @@ def matched_preprocessing(df1, group_cols, index_cols, df2=None, split_col=None,
     data1 = data1.unstack(group_cols)
     data2 = data2.unstack(group_cols)
     
+    if split_col is not None:
+        data1 = data1.drop([split_col], axis=1)
+        data2 = data2.drop([split_col], axis=1)
+        
     final = pd.DataFrame(data=0.0, columns=data1.columns.droplevel(0).unique(),
         index=data2.columns.droplevel(0).unique())
     
@@ -604,6 +608,7 @@ def matched_preprocessing(df1, group_cols, index_cols, df2=None, split_col=None,
         mat2 = data2.ix[:,data2.columns.get_level_values(0)==x]
         output = pd.DataFrame(data=0.0, columns=mat1.columns, index=mat2.columns)
         weights = pd.Series(data=0.0, index=mat2.columns)
+
         for lev in mat1.columns:
             if verbose:
                 print len(mat1.columns.values) - list(mat1.columns.values).index(lev),
@@ -615,6 +620,7 @@ def matched_preprocessing(df1, group_cols, index_cols, df2=None, split_col=None,
         output.columns = output.columns.droplevel(0)
         output.index = output.index.droplevel(0)
         final += output
+
         if verbose:
             print ' '
     
@@ -661,6 +667,11 @@ def matched_preprocessing(df1, group_cols, index_cols, df2=None, split_col=None,
         if combine:
             if verbose:
                 print 'combining data sets'
+            
+            if split_col is not None:
+                data1[split_col] = splits.index[1]
+                data2[split_col] = splits.index[0]
+
             data1 = data1.stack(group_cols).reset_index()
             data2 = data2.stack(group_cols).reset_index()
             data2_values = pd.Series([(x,y) for x,y in data2[group_cols].values])
