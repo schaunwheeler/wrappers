@@ -568,12 +568,22 @@ def tune_linkage(data, output_col, train_cols, k, similarity_metric,
     return output
 
 
-def matched_preprocessing(df1, df2, group_cols, index_cols, threshold=None,
-    k=1, combine=False, verbose=False):
+def matched_preprocessing(df1, df2=None, group_cols, index_cols, split_col=None,
+    threshold=None, k=1, combine=False, verbose=False):
 
-    data1 = df1.copy()
-    data2 = df2.copy()
-    
+    if df2 is not None:
+        data1 = df1.copy()
+        data2 = df2.copy()
+    elif split_col is not None:
+        splits = df1[split_col].value_counts()
+        if splits.shape[0]==2:
+            data1 = df1[df1[split_col]==split.index[1]].copy()   
+            data2 = df1[df1[split_col]==split.index[0]].copy()
+        else:
+            raise Exception('function can only match two data sets')
+    else:
+        raise Exception('df2 can be None or split_col can be None, but not both')
+            
     other_cols = [x for x in data1.columns if x not in (group_cols+index_cols)]
     data1 = data1.set_index(index_cols+group_cols)
     data2 = data2.set_index(index_cols+group_cols)
