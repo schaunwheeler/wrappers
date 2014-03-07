@@ -8,6 +8,7 @@ import sklearn.ensemble as sk_en
 import numpy as np
 import pandas as pd
 import multiprocessing
+import wrappers
 
 def miss_forest(xmis, maxiter=10, n_estimators=100, verbose=False,
     max_features='sqrt', bootstrap=True, nodesize=None, max_depth=None,
@@ -160,8 +161,11 @@ def miss_forest(xmis, maxiter=10, n_estimators=100, verbose=False,
                 print (list(cols_to_impute).index(col) + 1),
 
             observed = ~na_locations[col]
+            x_cols = [x for x in ximp.columns if x != col]            
+
             obs_y = ximp.ix[observed, col].squeeze().copy()
-            x_cols = [x for x in ximp.columns if x != col]
+            mis_y = ximp.ix[~observed, col].squeeze().copy()
+            
             obs_x = ximp.ix[observed, x_cols].copy()
             mis_x = ximp.ix[~observed, x_cols].copy()
 
@@ -176,11 +180,11 @@ def miss_forest(xmis, maxiter=10, n_estimators=100, verbose=False,
             # record out-of-bag error
             if grouping_variables is not None:
                 grp_index = grouping_index.ix[observed]
-                oob_error_val = mase(obs_y.values,rfr.oob_prediction_,
+                oob_error_val = wrappers.convenience.mase(obs_y.values,rfr.oob_prediction_,
                     grouping=grp_index.values)
                 oob_error.loc[oob_error.index==col, iteration_name] = oob_error_val
             else:
-                oob_error_val = mase(obs_y.values,rfr.oob_prediction_)
+                oob_error_val = wrappers.convenience.mase(obs_y.values,rfr.oob_prediction_)
                 oob_error.ix[oob_error.index==col, iteration_name] = oob_error_val
 
             # predict missing parts of Y

@@ -568,8 +568,8 @@ def tune_linkage(data, output_col, train_cols, k, similarity_metric,
     return output
 
 
-def matched_preprocessing(df1, group_cols, index_cols, df2=None, split_col=None,
-    threshold=None, k=1, combine=False, verbose=False):
+def matched_preprocessing(df1, group_cols, index_cols, df2=None, take_abs=True,
+    split_col=None, threshold=None, k=1, combine=False, ignore_cols=None, verbose=False):
 
     if df2 is not None:
         data1 = df1.copy()
@@ -594,9 +594,14 @@ def matched_preprocessing(df1, group_cols, index_cols, df2=None, split_col=None,
     if split_col is not None:
         data1 = data1.drop([split_col], axis=1)
         data2 = data2.drop([split_col], axis=1)
+    else:
+        split_col = ['']
+    
+    if ignore_cols is None:
+        ignore_cols = ['']
     
     other_cols = [x for x in df1.columns if x not in 
-        (group_cols+index_cols+[split_col])]
+        (group_cols + index_cols + [split_col] + ignore_cols)]
     
     final = pd.DataFrame(data=0.0, columns=data1.columns.droplevel(0).unique(),
         index=data2.columns.droplevel(0).unique())
@@ -624,7 +629,12 @@ def matched_preprocessing(df1, group_cols, index_cols, df2=None, split_col=None,
             if verbose:
                 print len(mat1.columns.values) - list(mat1.columns.values).index(lev),
             weights += (mat1[lev].notnull().mean() * mat2.notnull().mean())
-            corrs = (mat2.corrwith(mat1[lev]).abs() * weights)
+            corrs = mat2.corrwith(mat1[lev])
+            
+            if take_abs:
+                corrs = corrs.abs()
+
+            corrs = (corrs * weights)
             corrs = corrs.fillna(0)
             output.loc[:,lev] = corrs
         output = output.div(weights, axis='index')
