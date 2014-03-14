@@ -583,8 +583,7 @@ def matched_preprocessing(df1, group_cols, index_cols, df2=None, take_abs=True,
             raise Exception('function can only match two data sets')
     else:
         raise Exception('df2 can be None or split_col can be None, but not both')
-            
-    
+
     data1 = data1.set_index(index_cols+group_cols)
     data2 = data2.set_index(index_cols+group_cols)
     
@@ -594,14 +593,17 @@ def matched_preprocessing(df1, group_cols, index_cols, df2=None, take_abs=True,
     if split_col is not None:
         data1 = data1.drop([split_col], axis=1)
         data2 = data2.drop([split_col], axis=1)
+        split_col_placeholder = [split_col]
     else:
-        split_col = ['']
+        split_col_placeholder = ['']
     
     if ignore_cols is None:
-        ignore_cols = ['']
+        ignore_cols_placeholder = ['']
+    else:
+        ignore_cols_placeholder = ignore_cols
     
     other_cols = [x for x in df1.columns if x not in 
-        (group_cols + index_cols + [split_col] + ignore_cols)]
+        (group_cols + index_cols + split_col_placeholder + ignore_cols_placeholder)]
     
     final = pd.DataFrame(data=0.0, columns=data1.columns.droplevel(0).unique(),
         index=data2.columns.droplevel(0).unique())
@@ -616,7 +618,12 @@ def matched_preprocessing(df1, group_cols, index_cols, df2=None, take_abs=True,
     
     if verbose:
         print 'calculating correlations'    
-    
+
+    # alternative way to do correlations...not sure that it's any faster
+    #output = mat1.T.groupby(mat1.T.index).apply(
+    #    lambda x: mat2.corrwith(x.squeeze()))
+    #output = output.T
+
     for x in other_cols:
         if verbose:
             print x
@@ -682,8 +689,8 @@ def matched_preprocessing(df1, group_cols, index_cols, df2=None, take_abs=True,
                 flag_first = (flag.index[flag])[:(it+1)]
                 flag_first = ~flag.index.isin(flag_first)
                 final = final[~(match_flag.values & flag_first)]
-                if verbose:
-                    print ''
+            if verbose:
+                print ''
         
         final = final.groupby(group_cols).head(k)
         final = final.reset_index(drop=True)
