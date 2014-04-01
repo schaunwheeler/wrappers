@@ -102,186 +102,6 @@ scaledlevenshtein_simv = np.vectorize(lambda x: scaledlevenshtein_sim(*x))
 metaphone_simv = np.vectorize(lambda x: metaphone_sim(*x))
 jaccard_simv = np.vectorize(lambda x: jaccard_sim(*x))
 
-identical_simv.__name__ = 'identical_simv'
-absolute_simv.__name__ = 'absolute_simv'
-log1p_simv.__name__ = 'log1p_simv'
-percent_simv.__name__ = 'percent_simv'
-inverse_absolute_simv.__name__ = 'inverse_absolute_simv'
-inverse_log1p_simv.__name__ = 'inverse_log1p_simv'
-jarowinkler_simv.__name__ = 'jarowinkler_simv'
-scaledlevenshtein_simv.__name__ = 'scaledlevenshtein_simv'
-metaphone_simv.__name__ = 'metaphone_simv'
-jaccard_simv.__name__ = 'jaccard_simv'
-
-def dataframe_linkage2(records, settings, blocking, id_col=None, weights=None,
-    reset_index=True, threshold=None, keep_best=True, verbose=True):
-    '''
-    records : data frame or list of data frames to convert to dictionaries;
-        columns to be used in records linkage must be consistently named across
-        data frames; if a list or dictionary or two dataframes is passed to
-        records, the two dataframes will be linked. Otherwise, the function
-        assumes a single dataframe and will label duplicates
-    settings : file or dictionary containing settings to pass to dedupe module
-    blocking : column or list of columns on which to block records
-    id_col: name of column containing unique identifiers; id_col, 
-        like all columns, must be consistent across data frames
-    reset_index : reset index of data frames as a precaution to make sure each
-        row has a unique identifier
-    threshold : float between 0.0 and 1.0 indicating cutoff point below which
-        words will not be considered matches
-    keep_best : integer, when multiple potential matches are found for a word, 
-        the top keep_best will be kept
-    verbose : boolean, indicating whether to output informative messages during
-        the deduping process
-
-    Process
-    _______
-    
-    1. run with threshold==0.0 and keep_best==2
-    2. Get pairs
-    3. Randomly select pairs and evaluate them
-        a. Use input plus exact matches to determine threshold
-        b. Perform logistic regression on labelled data to weight dict keys
-    4. re-run with threshold=thredhold, keep_best=True
-
-
-
-    '''
-    
-    settings = dict(settings)    
-    
-    check_dicts = np.mean([type(v)==dict for (k,v) in settings.items()])
-
-    if check_dicts==0:
-        if weights is not None:
-            for (k,v) in settings.items():
-                settings[k] = {'function':v, 'weight': weights[k][v.__name__]}
-        else:
-            settings = {k:{'function':v, 'weight':1} for (k,v) in settings.items()}
-    elif check_dicts==1:
-        weights = True
-    else:
-        raise Exception('inconsistent value types in settings dictionary')
-        
-    if type(blocking) is not dict:
-        blocking = {blocking:return_same}
-        
-    record_type = type(records)
-    
-    if verbose:
-        print 'preparing records for linkage...'
-    
-    if record_type == dict:
-        input_ids = ['_'+(x) for x in records.keys()]
-        records = [x for x in records.values()]
-    elif record_type == list:
-        input_ids = ['_first', '_second']
-    elif record_type == pd.DataFrame:
-        input_ids = [None]
-        records = [records]
-
-    if reset_index:
-        records = [x.reset_index(drop=True) for x in records]
-    
-        if id_col is None:
-            id_col = 'id'
-            for i in range(len(records)):
-                records[i]['id'] = [str(x) for x in records[i].index]
-            
-    for i in range(len(records)):
-        blocker = records[i][blocking.keys()]
-        records[i].columns = records[i].columns.values + input_ids[i]
-
-        for key in blocking.keys():
-            blocker[key] = blocker[key].apply(blocking[key]).copy()
-        
-        if blocker.shape[1] > 1:
-            records[i]['blocker'] = blocker.fillna('').applymap(str).apply(
-                lambda x: ''.join(x), axis=1)
-        else:
-            records[i]['blocker'] = blocker.squeeze()
-    
-    blocker = set.intersection(*[set(x['blocker'].unique()) for x in records])
-    blocker = list(blocker)
-    
-    matched_df = pd.DataFrame()
-    
-    if verbose:
-        print 'matching in progress...'
-    
-    target_columns = settings.keys()
-    
-    for block in blocker:
-        if verbose:
-            print 'processing block %d of %d - columns (out of %d) completed:' % (
-                blocker.index(block) + 1, len(blocker), len(target_columns)) 
-        temp_records = [x[x['blocker']==block].copy() for x in records]
-        temp_records = pd.merge(temp_records[0], temp_records[1], 
-            how='outer', on ='blocker', suffixes = input_ids) 
-        temp_cols = temp_records.columns
-        id_columns = [x for x in temp_cols if x.startswith(id_col)]
-        results = temp_records[id_columns]
-
-        for col in target_columns:
-            wanted_cols = [col+x for x in input_ids]
-            pairs = temp_records[wanted_cols].to_records(index=False)
-            colname = col + '__' + settings[col]['function'].__name__
-            results[colname] = settings[col]['function'](pairs)
-            if verbose:
-                print '%d ' % (target_columns.index(col) + 1),
-        
-        weights_list = [x['weight'] for x in settings.values()]
-        column_order = [k + '__' + v['function'].__name__ for (k,v) in settings.items()]
-        means = results.set_index(id_columns)[column_order]
-        means = means * weights_list
-        means = means.sum(axis=1) / sum(weights_list)
-        means = means.reset_index(drop=True)
-        
-        results['mean_similarity'] = means
-
-        if threshold is not None:        
-            
-            keeps = (means > threshold).values
-            results = results[keeps]
-        
-        if keep_best:
-            
-            results = results.sort(columns='mean_similarity', ascending=False)
-            results = results.groupby(id_columns[0], as_index=False).head(keep_best)
-
-            results = results.sort(columns='mean_similarity', ascending=False)
-            results = results.groupby(id_columns[1], as_index=False).head(keep_best)
-
-        matched_df = matched_df.append(results, ignore_index=True)
-        print ''
-
-    matched_df['cluster_id'] = range(matched_df.shape[0])
-
-    records[0] = pd.merge(records[0], matched_df, how='left', on=id_columns[0])
-    records[1] = pd.merge(records[1], matched_df, how='left', on=id_columns[1])
-        
-    records[0] = records[0].rename(columns={id_columns[0]: id_col, 
-        id_columns[1]: id_col+'_match'})
-    records[1] = records[1].rename(columns={id_columns[1]: id_col, 
-        id_columns[0]: id_col+'_match'})
-
-    records[0].columns = [x.replace(input_ids[0], '') for x in 
-        records[0].columns]
-    records[1].columns = [x.replace(input_ids[1], '') for x in 
-        records[1].columns]
-    
-    start_cols = [id_col, id_col+'_match', 'cluster_id', 'blocker', 'mean_similarity']
-    other_cols = [x for x in records[0].columns if x not in start_cols]    
-    column_order = start_cols + other_cols    
-    records = [x[column_order] for x in records]
-    
-    if record_type == dict:
-        records = {input_ids[i].replace('_', ''):records[i] for i in 
-            range(len(input_ids))}
-    
-    return records
-
-
 def dataframe_linkage(records, settings, blocking, id_col=None, weights=None,
     reset_index=True, threshold=None, keep_best=True, verbose=True):
     '''
@@ -319,18 +139,20 @@ def dataframe_linkage(records, settings, blocking, id_col=None, weights=None,
     
     settings = dict(settings)    
     
-    check_dicts = np.mean([type(v)==dict for (k,v) in settings.items()])
+    check_dicts = np.mean([type(v)==dict for v in settings.values()])
 
     if check_dicts==0:
-        if weights is not None:
-            for (k,v) in settings.items():
-                settings[k] = {'function':v, 'weight': weights[k][v.__name__]}
-        else:
-            settings = {k:{'function':v, 'weight':1} for (k,v) in settings.items()}
+        for (k,v) in settings.items():
+                settings[k] = {'function':v, 'weight':1}
     elif check_dicts==1:
-        weights = True
+        pass        
     else:
         raise Exception('inconsistent value types in settings dictionary')
+
+    check_weights = np.mean(['weight' in x.keys() for x in settings.values()])
+
+    if check_weights!=1:
+        raise Exception('all dictionary values must include weights')
         
     if type(blocking) is not dict:
         blocking = {blocking:return_same}
@@ -391,16 +213,16 @@ def dataframe_linkage(records, settings, blocking, id_col=None, weights=None,
         id_columns = [x for x in temp_cols if x.startswith(id_col)]
         results = temp_records[id_columns]
 
-        for col in target_columns:
-            wanted_cols = [col+x for x in input_ids]
+        for tup in target_columns:
+            wanted_cols = [tup[0]+x for x in input_ids]
             pairs = temp_records[wanted_cols].to_records(index=False)
-            colname = col + '__' + settings[col]['function'].__name__
-            results[colname] = settings[col]['function'](pairs)
+            colname = '__'.join(tup)
+            results[colname] = settings[tup]['function'](pairs)
             if verbose:
-                print '%d ' % (target_columns.index(col) + 1),
+                print '%d ' % (target_columns.index(tup) + 1),
         
         weights_list = [x['weight'] for x in settings.values()]
-        column_order = [k + '__' + v['function'].__name__ for (k,v) in settings.items()]
+        column_order = ['__'.join(x) for x in settings.keys()]
         means = results.set_index(id_columns)[column_order]
         means = means * weights_list
         means = means.sum(axis=1) / sum(weights_list)

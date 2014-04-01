@@ -8,6 +8,25 @@ import pandas as pd
 import numpy as np
 import itertools
 
+def total_return_rate(x):
+    x_min = x.min() + 0.0000000001
+    return ((x.values + x_min).cumprod() - x_min)[-1]
+
+def cagr(x):
+    return ((x[-1]/x[0])**(1/len(x)))-1
+
+def annualize(x):
+    x_min = x.min() + 0.0000000001
+    return (np.product(x.values+x_min)**(1/len(x)))-x_min
+
+def maximum_drawdown_raw(x):
+    return (x-pd.expanding_max(x)).min()
+
+def maximum_drawdown_rate(x):
+    x_min = x.min() + 0.0000000001
+    y = ((x.values + x_min).cumprod() - x_min)
+    return ((y/pd.expanding_max(y))-1).min()
+
 
 def set_module_path(module_name, guide='user', choose_max=True):
     '''Allows a custom script to be imported as a module from outside
@@ -352,18 +371,42 @@ def ensure_dir(f):
 
 def mase(preds, original, grouping=None, func=None):
     if func is None:
-        func = lambda z: np.mean(np.abs(np.mean(z) - z))
+        func = lambda z: np.abs(np.mean(z) - z)
 
     absolute_error = np.abs(preds - original)
 
     if grouping is not None:
-        naive_mae = pd.Series(original).groupby(grouping).transform(func).values
+        naive_ae = pd.Series(original).groupby(grouping).transform(func).values
     else:
-        naive_mae = func(original)
+        naive_ae = func(original)
 
-    ase = absolute_error / naive_mae
+    ase = absolute_error / naive_ae
     ase[ase==np.inf] = np.nan
     ase[ase==-np.inf] = np.nan
     ase = ase[~np.isnan(ase)]
-    output = np.mean(ase)
+    output = np.mean(ase<1)
     return output
+
+def summary_covariates(df, cols, group_cols=None, sep_string='___', funcs=None):
+
+    x = df.copy()    
+    ind = x.index
+    
+    if (len(x.index.names)>1) | (x.index.names[0] != None):
+        x = x.reset_index()
+
+    if funcs is None:
+        funcs = {'mean':np.mean}
+    
+    if group_cols is not None:
+        y = df.groupby(group_cols)
+    else:
+        y = df.copy()
+
+    for col in cols:
+        for name, func in funcs.items():
+            x[col+sep_string+name] = y[col].transform(lambda z: func(z))
+    
+    x = x.set_index(ind)
+    
+    return x
