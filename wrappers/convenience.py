@@ -1,5 +1,8 @@
 # -*- coding: utf-8 -*-
 
+#'dialect+driver://username:password@host:port/database'
+#sqlalchemy.create_engine('postgresql://schaunwheeler:@localhost:5432/herokulocaldb')
+
 import os
 import inspect
 import sys
