@@ -4,6 +4,6 @@
 import imputation
 import record_linkage
 import convenience
-import clustering
-import modeling
+from modeling import *
 import manipulation
+del modeling
