@@ -18,169 +18,7 @@ from sklearn.metrics.pairwise import pairwise_distances
 import statsmodels.nonparametric.smoothers_lowess as smoother
 import time
 
-def geometric_mean(x):
-    return np.exp(np.log(1+np.abs(x)).mean())-1
 
-def progress_bar(item, l, interval=0.05):
-    rounder = len(str(interval).split('.')[1])
-    prange = np.arange(0, 1+interval, interval)
-    prange = [round(x, rounder) for x in prange]
-    n = len(l)
-    i = l.index(item)
-    if (i>0.0) & (i<(n-1)):
-        old_percent = (i-1)/n
-        percent = i/n
-        prange = [x for x in prange if x>old_percent]
-        if percent>=min(prange):
-            print percent,
-    else:
-        print i/(n-1),
-
-def linear_impute(x, poly=None, log=False):
-    y = x.copy()        
-    if log:
-        y = np.log(y+1)
-    to_test = y.isnull()
-    train = pd.DataFrame({'x':y[~to_test].index.values})
-    test = pd.DataFrame({'x':[y[to_test].index.values]})
-    if poly is not None:
-        for p in poly:
-            train['x'+str(p)] = train['x']**p
-            test['x'+str(p)] = test['x']**p
-    f = LinearRegression().fit(X=train, y=y.dropna())
-    out = f.predict(test)
-    y[y.isnull()] = out[0]
-    if log:
-        y = np.exp(y)-1
-    return y
-
-
-def simple_lag_estimate(x, shift, poly=None, log=False, index=None):
-    if type(index)==str:
-        index = x.index.get_level_values(index).values
-    elif index is not None:
-        y = pd.Series(x, index=index[:len(x)])
-    else:
-        y = x.copy()        
-    if log:
-        y = np.log(y+1)
-    train = pd.DataFrame({'x':y.index.values})
-    target = y.index.values.max()+shift
-    test = pd.DataFrame({'x':[target]})
-    if poly is not None:
-        for p in poly:
-            train['x'+str(p)] = train['x']**p
-            test['x'+str(p)] = test['x']**p
-    f = LinearRegression().fit(X=train, y=y.dropna())
-    out = f.predict(test)[0]
-    if log:
-        out = np.exp(out)-1
-    out = pd.DataFrame(out, columns=[target], index=x.columns).T
-
-    return out 
-
-def lag_data(data, yname, lags, time_var, append=None, group=None, extra=None, 
-             linear_guess=None):
-    
-    index_vars = []
-    if append is not None:
-        index_vars = index_vars + append.keys()
-        grouper = append.keys()
-    if group is not None:
-        index_vars = index_vars + group
-        grouper = grouper + group
-    if extra is not None:
-        index_vars = index_vars + extra
-    
-    data = data.sort(time_var)
-    data = data.set_index(index_vars+[time_var])
-    
-    data_list = []    
-    for l in lags:
-        print l, 
-        
-        main = data.groupby(level=index_vars).shift(l).dropna()
-        if append is not None:
-            y_list = {k:main[v].copy() for k,v in append.items()}
-            drop_cols = list(set([x for y in append.values() for x in y]))
-            main = main.drop(drop_cols, axis=1)
-        
-        if linear_guess is not None:
-            y_lin = data[yname].copy()
-            y_lin.index = y_lin.index.droplevel(extra)
-            y_lin = y_lin.unstack(grouper)
-            impute = y_lin.isnull().sum()>0
-            y_lin.loc[:,impute] = y_lin.loc[:,impute].apply(
-                lambda x: linear_impute(x, log=True))
-            last_period = y_lin.index.values.max() - l
-            periods = y_lin.loc[:last_period].index.values
-            guess_df = pd.DataFrame(columns=periods[1:]+l, index=y_lin.columns)
-            guess = pd.Series(np.zeros(y_lin.shape[1]), index=y_lin.columns)
-            for p in periods[1:]:
-                name = p+l
-                for g in linear_guess:
-                    keep = y_lin.loc[:p,:]
-                    est = simple_lag_estimate(keep, shift=l, **g)
-                    guess = guess + est.T.squeeze()
-                guess = guess / len(linear_guess)
-                guess_df[name] = guess
-            guess_df.columns.names = [time_var]
-            guess_df = guess_df.stack()
-            matcher_y = pd.match(main.index.droplevel(extra).values,
-                   guess_df.index.values)
-            main_idx = matcher_y>=0
-            matcher_y = matcher_y[main_idx]
-            guess_df = guess_df.iloc[matcher_y]
-            guess_df.index = main.index[main_idx]
-            guess_df = guess_df.to_frame('guess')
-            main = pd.concat([main, guess_df], axis=1)
-
-        if append is not None:
-            for k in append.keys():
-                for c in y_list[k].columns:
-                    y = y_list[k][c].copy()
-                    y.index = y.index.droplevel(extra)
-                    y = y.groupby(level=[time_var]+group, group_keys=False, 
-                        sort=False).apply(lambda x: x.unstack(k))
-                    y.columns = [c+'_'+str(x) for x in y.columns]
-                    y = y.fillna(0)
-                    matcher_y = pd.match(main.index.droplevel(extra+[k]).values,
-                                       y.index.values)
-                    main_idx = matcher_y>=0
-                    matcher_y = matcher_y[main_idx]
-                    y = y.iloc[matcher_y,:]
-                    y.index = main.index[main_idx]
-                    main = pd.concat([main, y], axis=1)
-
-        main = main.dropna()
-        data_list.append(main)
-
-    data = data[[yname]]
-
-    if lags != [0]:
-        data = pd.concat([data]+data_list, axis=1, keys=[0]+lags,
-                 names=['lag', 'variable'])
-    else:
-        data = pd.concat([data]+data_list, axis=1)
-        if type(data.columns) == pd.MultiIndex:
-            idx = pd.MultiIndex.from_tuples([(0,)+x for x in data.columns],
-                names=['lag', 'variable'])
-        else:
-            idx = pd.MultiIndex.from_tuples([(0,x) for x in data.columns],
-                 names=['lag', 'variable'])
-        data.columns = idx
-
-    keep_years = np.unique(data.dropna().index.get_level_values(time_var).values)
-
-    if lags == [0]:
-        keep_years = [np.max(keep_years)]
-    keep_years = data.index.get_level_values(time_var).isin(keep_years)
-    data = data[keep_years]
-    
-    data = data.fillna(0)
-    
-    return data
-        
 class Cluster(object):
     
     def __init__(self, data, value_var, cluster_vars, index_vars=None, 
@@ -214,7 +52,7 @@ class Cluster(object):
             jaccard = pairwise_distances(self.data.T.notnull().values, 
                                          metric='jaccard')
             jaccard = 1 - jaccard
-            corrs = corrs * jaccard
+            corrs *= jaccard
             filler = 1.0
         else:
             filler = 0.5
@@ -255,14 +93,13 @@ class Cluster(object):
         self.threshold = t
         self.cluster_assignments = fclust
         self.assignment_dict_keylevels = self.correlation_matrix.index.names
-        self.assignment_dict = pd.Series(self.cluster_assignments, 
-                index=self.correlation_matrix.index).to_dict()
+        self.assignment_dict = pd.Series(self.cluster_assignments, index=self.correlation_matrix.index).to_dict()
 
     def dendrogram(self, plot=True, **kwargs):
         no_plot = not plot
-        dend = dendrogram(self.linkage_output, 
-            labels=self.correlation_matrix.columns, 
-            color_threshold=self.threshold, no_plot=no_plot, **kwargs)
+        dend = dendrogram(
+            self.linkage_output, labels=self.correlation_matrix.columns, color_threshold=self.threshold,
+            no_plot=no_plot, **kwargs)
         self.dendrogram_dict = dend
     
     def collect_groups(self):
@@ -310,7 +147,7 @@ class Cluster(object):
                 c_corr = self.correlation_matrix.loc[keep, keep]
                 c_corr_inds = np.triu_indices_from(c_corr, k=1)
                 c_corr = c_corr.values[c_corr_inds]
-                if len(c_corr)==0:
+                if len(c_corr) == 0:
                     c_corr = np.array([1])
                 output[var+'_mean_corr'][c] = c_corr.mean()
                 output[var+'_min_corr'][c] = c_corr.min()
@@ -328,23 +165,18 @@ class Cluster(object):
                 on=self.cluster_cols)
         return new_data
 
-    def group_recursive(self, corr_method='pearson', weight=True, absolute=False,
-        auto_exclude=None, linkage_method='complete', linkage_kwargs=None,
-        t=0.0525, criterion='distance', scale=False, transform=None, 
-        **fclust_kwargs):
-        if linkage_kwargs is None:
-            linkage_kwargs = {}
-        self.corr_dist(method=corr_method, weight=weight, absolute=absolute,
-                       auto_exclude=auto_exclude, scale=scale, 
-                       transform=transform)
+    def group_recursive(
+            self, corr_method='pearson', weight=True, absolute=False, auto_exclude=None, linkage_method='complete',
+            linkage_kwargs=None, t=0.0525, criterion='distance', scale=False, transform=None, **fclust_kwargs):
+        linkage_kwargs = {} if linkage_kwargs is None else linkage_kwargs
+        self.corr_dist(
+            method=corr_method, weight=weight, absolute=absolute, auto_exclude=auto_exclude, scale=scale,
+            transform=transform)
         self.linkage(method=linkage_method, **linkage_kwargs)
         self.assign_clusters(t=t, criterion=criterion, **fclust_kwargs)
-        if auto_exclude is None:
-            keep = []
-        else:
-            keep = auto_exclude
-        
-        i=0
+        keep = [] if auto_exclude is None else auto_exclude
+
+        i = 0
         old_tag = 'cluster_id'
         tag = 'cluster_id_'+str(i)
         n_clusts = np.inf
@@ -353,21 +185,20 @@ class Cluster(object):
         reserve = new_data.copy()
         reserve['ind'] = new_data.index
         
-        while n_clusts_new<n_clusts:
+        while n_clusts_new < n_clusts:
             reserve_cols = [x for x in self.cluster_cols if x not in keep+[old_tag]]
             new_cluster_vars = [tag] + keep
-            new_index_vars = [x for x in self.index_cols if x not in 
-                reserve_cols+new_cluster_vars+[old_tag]]
+            new_index_vars = [x for x in self.index_cols if x not in reserve_cols + new_cluster_vars + [old_tag]]
     
             reserve['ind'] = reserve[tag]
             new_data = new_data.groupby(new_index_vars+new_cluster_vars)
             new_data = new_data[self.value_var].sum().reset_index()
     
-            self.__init__(data=new_data, value_var=self.value_var, 
-                cluster_vars=new_cluster_vars, index_vars=new_index_vars)
-            self.corr_dist(method=corr_method, weight=weight, absolute=absolute,
-                           auto_exclude=auto_exclude, scale=scale, 
-                           transform=transform)
+            self.__init__(
+                data=new_data, value_var=self.value_var, cluster_vars=new_cluster_vars,index_vars=new_index_vars)
+            self.corr_dist(
+                method=corr_method, weight=weight, absolute=absolute, auto_exclude=auto_exclude, scale=scale,
+                transform=transform)
             self.linkage(method=linkage_method, **linkage_kwargs)
             self.assign_clusters(t=t, criterion=criterion, **fclust_kwargs)
     
@@ -383,8 +214,7 @@ class Cluster(object):
             new_data = new_data.groupby(new_index_vars+keep+[tag])
             new_data = new_data[self.value_var].sum().reset_index()            
             
-            self.__init__(data=new_data, value_var=self.value_var, 
-                cluster_vars=keep+[tag], index_vars=new_index_vars)
+            self.__init__(data=new_data, value_var=self.value_var, cluster_vars=keep+[tag], index_vars=new_index_vars)
             
             self.aggregated_data = new_data
             self.recursive_data = reserve.drop(['ind'], axis=1)
@@ -407,279 +237,828 @@ class Cluster(object):
             
         return self.summary
         
-    def quick_run(self, corr_method='pearson', weight=True, auto_exclude=None,
-        absolute=False, link_method='complete', threshold=0.0525, scale=False,
-        criterion='distance', transform=None, plot=True):
-        self.corr_dist(method=corr_method, weight=weight, absolute=absolute,
-                       auto_exclude=auto_exclude, scale=scale, 
-                       transform=transform)
+    def quick_run(
+            self, corr_method='pearson', weight=True, auto_exclude=None, absolute=False, link_method='complete',
+            threshold=0.0525, scale=False, criterion='distance', transform=None, plot=True):
+        self.corr_dist(
+            method=corr_method, weight=weight, absolute=absolute, auto_exclude=auto_exclude, scale=scale,
+            transform=transform)
         self.linkage(method=link_method)
         self.assign_clusters(t=threshold, criterion=criterion)
         self.dendrogram(plot=plot)
         self.summarize()
         return self.summary
 
+
+def bulk_linear_impute(y, x=None, poly=None, log=False):
+    """Impute missing values for an entire data frame using sklearn.linear_model.LinearRegression
+
+    Args:
+        y (pandas.DataFrame): a dataframe where each row is a time period and each column is a metric to be predicted.
+        x (numpy.array, optional): time periods of length y.shape[0]; default (None), assumes to be the index of y
+        poly (list): polynomials to build into the prediction
+        log (boolean): whether to log y before predicting
+
+    Returns:
+        pd.DataFrame: original data frame with missing values filled in
+
+
+    """
+
+
+    nulls = y.isnull().multiply(y.index.values, axis=0).mean()
+    null_vals = nulls[nulls > 0.].unique()
+
+    for null_val in null_vals:
+        use = (nulls == null_val).values
+        y_use = y.loc[:, use].copy()
+        if x is not None:
+            x_use = x.copy()
+        else:
+            x_use = y.index.values
+        if log:
+            y_use = np.log(y_use+1)
+        to_test = (y_use.isnull().sum(axis=1) > 0.0).values
+        train = pd.DataFrame({'x': x_use[~to_test]})
+        test = pd.DataFrame({'x': x_use[to_test]})
+        if poly is not None:
+            for p in poly:
+                train['x' + str(p)] = train['x'] ** p
+                test['x' + str(p)] = test['x'] ** p
+        f = LinearRegression().fit(X=train, y=y_use.dropna())
+        out = f.predict(test)[0]
+        if log:
+            out = np.exp(out) - 1
+        y.loc[to_test, use] = out
+
+    return y
+
+
+def bulk_lag_estimate(y, shift, x=None, poly=None, log=False):
+    """Create estimates for a specific time horizon for an entire data frame.
+
+    No missing values permitted.
+
+    Args:
+        y (pandas.DataFrame): a dataframe where each row is a time period and each column is a metric to be predicted.
+        shift (int): number of time periods to predict ahead
+        x (numpy.array, optional): time periods of length y.shape[0]; default (None) assumes to be the index of y
+        poly (list): polynomials to build into the prediction
+        log (boolean): whether to log y before predicting
+
+    Returns:
+        pd.Series: series of estimates for horizon specified by `shift`
+
+
+    """
+
+    y_use = y.copy()
+    if x is not None:
+        x_use = x.copy()
+    else:
+        x_use = y.index.values
+    if log:
+        y_use = np.log(y_use+1)
+    train = pd.DataFrame({'x': x_use})
+    target = x_use.max()+shift
+    test = pd.DataFrame({'x': [target]})
+    if poly is not None:
+        for p in poly:
+            train['x' + str(p)] = train['x'] ** p
+            test['x' + str(p)] = test['x'] ** p
+    f = LinearRegression().fit(X=train, y=y_use)
+    out = f.predict(test)[0]
+    if log:
+        out = np.exp(out) - 1
+
+    out = pd.Series(out, index=y.columns)
+    out.name = target
+
+    return out
+
+
+def make_weights(pool, q):
+    pool = np.array(pool)
+    probs = np.argsort(pool)
+    probs = probs / probs.sum()
+    probs = 1.0 / (1.0 + (np.abs(q - probs)))
+    np.place(probs, np.isinf(probs) | np.isnan(probs), 0)
+    probs = probs / probs.sum()
+    return probs
+
+
+class MarketSizes(object):
+    """Class to load and manipulate Euromonitor Market Sizes data.
+
+    This class's methods make a lot of assumptions about the structure of the market sizes table structure.
+
+
+
+    """
+
+    def __init__(self, conn):
+        """Establish database connection and load some data for later use
+
+        Args:
+            conn (sqlalchemy.engine.base.Engine): a database engine created through SQLAlchemy
+
+        Attributes:
+            countries_ (pandas.DataFrame): country id (iso3) and name
+            categories_ (pandas.DataFrame): Euromonitor product category id and name
+            country_dict (dict): dictionary to map country ids to names
+            category_dict (dict): dictionary to map category ids to names
+            data_ (pandas.DataFrame): placeholder for data
+            lagged (dict): container for lagged data sets
+            extrapolated (dict): container for extrapolated data sets
+            staging_data_ (pandas.DataFrame): lagged and reshaped data, ready for analysis
+
+
+        """
+        self.conn = conn
+        self.countries_ = pd.read_sql('SELECT iso3 AS id, name FROM countries_country', conn)
+        self.country_dict = self.countries_.set_index('id')['name'].to_dict()
+        self.categories_ = pd.read_sql('SELECT id, name FROM industries_emcategory', conn)
+        self.category_dict = self.categories_.set_index('id')['name'].to_dict()
+        self.data_ = pd.DataFrame()
+        self.lagged = {}
+        self.extrapolated = {}
+        self.staging_data_ = pd.DataFrame()
+
+    def get_data(self, years=None, forecasts=False, silent=True):
+        """Load Euromonitor Market Sizes data and some other metrics.
+
+        Args:
+            years (list): list of years to pull
+            forecasts (boolean): whether to includes years where data is a Euromonitor estimate
+            silent (boolean): whether to return dataframe containing data
+
+        Returns:
+            nothing if silent==True. Data will be put in data_ attribute.
+            Data has following columns:
+                country_id: iso3 code
+                year: year
+                category_id: euromonitor category id
+                type: category type (on-trade, off-trade, foodservice, etc.)
+                gdp_ppp: GDP at purchasing power parity (from WorldBank)
+                gdp_percapita: GDP per capita (from WorldBank)
+                spend_total: total constant 2011 dollars spent on category within country/year combination
+                population: total population (from UN)
+                spend_percapita: spend total divided by population
+                spend_share: spend_total divided by sum of spend total of top-level categories after omiting
+                    on-trade/off-trade distinctions
+
+
+        """
+
+        # format years for inclusion in SQL statement
+        years = range(1950, 2050) if years is None else years
+        years = ', '.join([str(x) for x in years])
+
+        # exclude these countries (regions) from pull
+        countries = ['AA', 'AP', 'EE', 'LA', 'MA', 'NAC', 'WE', 'WLD']
+        countries = ', '.join([repr(x) for x in countries])
+
+        # format WorldBank variables for inclusion in SQL statement
+        variables = ['NY_GDP_PCAP_PP_KD', 'NY_GDP_MKTP_PP_KD']
+        variables = ', '.join([repr(x) for x in variables])
+
+        marketsizes = pd.read_sql(
+            '''
+            SELECT
+                ms.country_id,
+                ms.year,
+                ms.emcategory_id as category_id,
+                type.name as type,
+                ms.first_forecast,
+                /*ms.type_id,*/
+                /*ms.fx_id,*/
+                /*ms.price_id,*/
+                /*ms.unit_id,*/
+                ms.size * (fx.value / fxbaseline.value) * 1000000 as spend_total
+            FROM industries_marketsize as ms
+            LEFT JOIN countries_countrydata AS fx
+                ON ms.country_id = fx.country_id
+                AND ms.year = fx.year
+                AND fx.indicator_id = 'fx'
+            LEFT JOIN countries_countrydata AS fxbaseline
+                ON ms.country_id = fxbaseline.country_id
+                AND fxbaseline.year = 2011
+                AND fxbaseline.indicator_id = 'fx'
+            LEFT JOIN industries_type AS type
+                ON ms.type_id = type.id
+            WHERE ms.size IS NOT NULL
+                AND fx.value IS NOT NULL
+                AND fxbaseline.value IS NOT NULL
+                AND ms.fx_id=1
+                AND ms.unit_id=10
+                AND ms.type_id IN (3, 9, 10, 11, 12, 13)
+                AND ms.country_id NOT IN ({c})
+                AND ms.year IN ({y});
+            '''.format(y=years, c=countries), self.conn)
+
+        population = pd.read_sql(
+            '''
+            SELECT
+                country_id,
+                year,
+                SUM(people)*1000 AS value
+            FROM countries_population
+            WHERE country_id NOT IN ({c})
+                AND year IN ({y})
+            GROUP BY country_id, year;
+            '''.format(y=years, c=countries), self.conn)
+        population['indicator_id'] = 'population'
+
+        features = pd.read_sql(
+            '''
+            SELECT
+              country_id,
+              year,
+              indicator_id,
+              value
+            FROM countries_countrydata
+            WHERE country_id NOT IN ({c})
+              AND indicator_id IN ({v})
+              AND year IN ({y});
+            '''.format(y=years, c=countries, v=variables), self.conn)
+        features = pd.concat([features, population])
+        features = features.set_index(['country_id', 'year', 'indicator_id'])
+        features = features['value'].unstack(['country_id', 'indicator_id'])
+
+        # Impute missing values for WorldBank indicators
+        features1 = bulk_linear_impute(features, log=True)
+        features2 = bulk_linear_impute(features, poly=[2], log=True)
+        features = (features1 + features2) / 2.0
+        features = features.stack('country_id').reset_index()
+        features = features.rename(columns={'NY_GDP_MKTP_PP_KD': 'gdp_ppp', 'NY_GDP_PCAP_PP_KD': 'gdp_percapita'})
+
+        # Merge demographic data with marketsizes data
+        data = pd.merge(marketsizes, features, how='left', on=['year', 'country_id'])
+
+        # Calculate alternative consumption measures
+        data['spend_percapita'] = data['spend_total'] / data['population']
+        data = data.dropna(subset=['spend_total', 'spend_percapita'])
+
+        def calc_spend_share(df):
+            """Calculate spend share by omitting on/off-trade distinctions from top-level categories"""
+
+            ontrade = df['type'].str.contains('^On-trade')
+            offtrade = df['type'].str.contains('^Off-trade')
+            firstlevel = df['category_id'].str.endswith('-00-00-00-00-00-00')
+            share = df['spend_total'] / df[~ontrade & ~offtrade & firstlevel]['spend_total'].sum()
+            share[share == np.inf] = 0.0
+            return share
+
+        grp = data.groupby(['country_id', 'year'], group_keys=False, sort=False, squeeze=True)
+        data['spend_share'] = grp.apply(calc_spend_share)
+
+        if not forecasts:
+            keep = (data['year'] < data['first_forecast']) | data['first_forecast'].isnull()
+            data = data[keep].drop(['first_forecast'], axis=1)
+
+        self.data_ = data.copy()
+
+        if not silent:
+            return data.copy()
+
+    def lag(self, index, metrics, time, shift, silent=True):
+        """Align lagged data with dataframe.
+
+        Args:
+            index (list): columns of self.data_ to use to form a unique index
+            metrics (list): columns of self.data_ for which to create lagged versions
+            time (list): columns of self.data_ that delineate time periods
+            shift (int): number of time periods to lag
+            silent (boolean): whether to silently keep output as attribute of class, or to return the object
+
+        Returns:
+            pandas.DataFrame: self.data_ with lagged variables appended
+
+
+        """
+
+        df = self.data_.copy()
+        side_columns = [x for x in df.columns if x not in (index + metrics)]
+        df = df.set_index(index)
+        reserve = df[side_columns]  # hold out for later
+        df = df.drop(side_columns, axis=1)
+        df = df.stack()
+        df.index.names = ['metric' if x is None else x for x in df.index.names]
+        df = df.unstack([x for x in df.index.names if x not in time])
+        df = pd.concat([df, df.shift(shift)], keys=[0, shift], names=['lag', 'year'])
+        df = df.stack([x for x in df.columns.names if x != 'metric']).unstack('lag')
+        df.columns = df.columns.reorder_levels(['lag', 'metric'])
+        df = df.T.sort_index().T
+        df.index = df.index.reorder_levels(index)
+        reserve.index = reserve.index.reorder_levels(index)
+        reserve.columns = [(0, x) for x in reserve.columns]
+        dropna_cols = df.columns.values
+        df = pd.concat([df, reserve], axis=1)
+        df = df.dropna(subset=dropna_cols)
+        df.columns = pd.MultiIndex.from_tuples(df.columns, names=['lag', 'metric'])
+        self.lagged[shift] = df.copy()
+        if not silent:
+            return df.copy()
+
+    def extrapolate(self, index, metrics, time, shift, silent=True):
+        """Create simple linear predictions at a specified time horizon.
+
+        Args:
+            index (list): columns of self.data_ to use to form a unique index
+            metrics (list): columns of self.data_ for which to create lagged versions
+            time (list): columns of self.data_ that delineate time periods
+            shift (int): number of time periods forward to forecast
+            silent (boolean): whether to silently keep output as attribute of class, or to return the object
+
+        Returns:
+            pandas.DataFrame: self.data_ with extrapolations appended in new columns
+
+
+        """
+
+        df = self.data_.copy()
+        side_columns = [x for x in df.columns if x not in (index + metrics)]
+        df = df.set_index(index)
+        reserve = df[side_columns]  # hold out for later
+        df = df.drop(side_columns, axis=1)
+        df = df.stack()
+        df.index.names = ['metric' if x is None else x for x in df.index.names]
+        df = df.unstack([x for x in df.index.names if x not in time])
+
+        # impute missing values (extrapolation can't handle them)
+        only_one = df.notnull().sum() == 1.0
+        df.loc[:, only_one.values] = df.loc[:, only_one.values].replace(np.nan, 0.0)
+        dfi1 = bulk_linear_impute(df, poly=[2], log=True)
+        dfi2 = bulk_linear_impute(df, poly=None, log=True)
+        df = (dfi1 + dfi2) / 2.0
+        df[df < 0.0] = 0.0
+
+        # extrapolate in any cases where we have at least three years
+        df_years = df.index.values[2:]
+        df_years = df_years[df_years <= (df.index.values.max() - shift)]
+        df1 = [bulk_lag_estimate(df.loc[:i, :], shift, poly=[2], log=True) for i in df_years]
+        df1 = pd.concat(df1, axis=1).T
+        df2 = [bulk_lag_estimate(df.loc[:i, :], shift, poly=None, log=True) for i in df_years]
+        df2 = pd.concat(df2, axis=1).T
+        df_pred = (df1 + df2) / 2.0
+        df_pred[df_pred < 0.0] = 0.0
+
+        df = pd.concat([df, df_pred], keys=[0, shift], names=['forecast', 'year'])
+        df = df.stack([x for x in df.columns.names if x != 'metric']).unstack('forecast')
+        df.columns = df.columns.reorder_levels(['forecast', 'metric'])
+        df = df.T.sort_index().T
+        df.index = df.index.reorder_levels(index)
+        reserve.index = reserve.index.reorder_levels(index)
+        reserve.columns = [(0, x) for x in reserve.columns]
+        dropna_cols = df.columns.values
+        df = pd.concat([df, reserve], axis=1)
+        df = df.dropna(subset=dropna_cols)
+        df.columns = pd.MultiIndex.from_tuples(df.columns, names=['forecast', 'metric'])
+        self.extrapolated[shift] = df.copy()
+
+        if not silent:
+            return df.copy()
+
+    def reshape(self, lag, target, rows, predictors, category, threshold=0.1, silent=True):
+        """
+        Args:
+            lag (str or int): key of output of calling `self.lag`; use a negative value to create test data
+            target (str): column name of metric to populate values of new matrix
+            rows (list): names of columns to use as rows in new matrix
+            predictors (list): names of columns to use as predictors (columns) in new matrix
+            category (dict): index names and values to subset data
+            threshold (float): percentage of reshaped columns that must be non-null in order to keep row; rows with
+                percentge of null values below threshold will have missing values filled with 0.0
+
+
+        """
+
+        lagger = lag if lag > 0 else 0
+        df = self.lagged[lagger].copy() if lag > 0 else self.lagged.values()[0]
+        pivot_columns = [x for x in df.index.names if x not in rows]
+        df_target = df.copy()
+        for key, val in category.items():
+            df_target = df_target.xs(val, level=key, drop_level=False)
+        df_target = df_target[[(0, target)]].unstack(pivot_columns)
+        new_cols = [(-1,) + x[1:] for x in df_target.columns.values]
+        df_target.columns = pd.MultiIndex.from_tuples(new_cols, names=df_target.columns.names)
+        pred_columns = [(lagger, x) for x in predictors]
+        df_match = df[pred_columns].unstack(pivot_columns)
+        empties = (df_match.isnull().mean() == 1.0).values
+        df_match = df_match.loc[:, ~empties]
+        keep = df_match.notnull().mean(axis=1) >= threshold
+        df_match = df_match.loc[keep, :]
+        df_match = df_match.fillna(0.0)
+        df = pd.merge(df_target, df_match, how='left', left_index=True, right_index=True)
+        final_cols = [(np.abs(lag),) + x[1:] if x[0]!=-1 else x for x in df.columns.values]
+        df.columns = pd.MultiIndex.from_tuples(final_cols, names=df.columns.names)
+        self.staging_data_ = df.copy()
+
+        if not silent:
+            return df.copy()
+
+
 class Ensemble(object):
-    def __init__(self, data, yname, prep=True):
+    """Class to use ensemble (tree) methods to select features, cross-validate model fit, and predict to new data.
+
+
+    """
+
+    def __init__(self, data, yname, prep=False):
+        """Load data and set up basic model parameters
+
+        Args:
+            data (pandas.DataFrame): the data to train the model
+            yname (str): the name of the column representing the outcome variable
+            prep (bool): whether to ensure the dataset has only float values in it
+
+        Attributes:
+            data_ (pandas.DataFrame): the data, ready for analysis
+            prep (bool): flag to remember initialization settings
+            yname (str): name of outcome variable
+            scaler (dict): initial mean and standard error for scaling data (defaults to no scaling)
+            modeler (sklearn.ensemble): model class from sklearn
+            feature_importances_ (pandas.Series): feature importance scores from a fit model
+            training_data_scaled_ (pandas.DataFrame): normalized data_
+            test_data_ (pandas.DataFrame): new data for which to predict outcomes
+            test_data_scaled_ (pandas.DataFrame): normalized test_data_
+            predictions_ (pandas.DataFrame): predictions from model
+            kfold_results_ (list): list of cross-validation results
+            kfold_predictions_ (pandas.DataFrame): predctions from k-fold cross-validation
+            errors_ (pandas.DataFrame): all simulated errors
+            error_estimates_ (pandas.DataFrame): error estimates at specified quantiles
+            simulations_ (pandas.DataFrame): simulated responses for single predictors
+            coefficients_ (pandas.DataFrame): linear coefficients for simulations
+
+
+        """
+
         self.data_ = data.copy()
         self.prep = prep
         self.yname = yname
-        self.scaler = {'mean':0, 'std':1}
+        self.scaler = {'mean': 0, 'std': 1}
+        self.modeler = None
+        self.feature_importances_ = pd.Series()
+        self.training_data_scaled_ = pd.DataFrame()
+        self.test_data_ = pd.DataFrame()
+        self.test_data_scaled_ = pd.DataFrame()
+        self.predictions_ = pd.DataFrame()
+        self.kfold_results_ = []
+        self.kfold_predictions_ = pd.DataFrame()
+        self.errors_ = pd.DataFrame()
+        self.error_estimates_ = pd.DataFrame()
+        self.simulations_ = pd.DataFrame()
+        self.coefficients_ = pd.DataFrame()
 
         if prep:
             move = [x not in [np.float, np.int, np.bool] for x in data.dtypes]
             ind = data.dtypes.index[move]
-            if len(ind)>0:
-                self.data_ = data.copy().set_index(ind).astype('float64')
-                
-    def _save_state(self):
-        saver = dict(data=self.data_.copy(), yname=self.yname, 
-             prep=self.prep, modeler = clone(self.modeler))
-        self.saved_state_  = dict(saver)
-    
-    def _load_state(self):
-        old_data = self.saved_state_['data']
-        old_yname = self.saved_state_['yname']
-        old_prep = self.saved_state_['prep']
-        old_modeler = self.saved_state_['modeler']
+            if len(ind) > 0:
+                self.data_ = data.copy().set_index(ind, append=True).astype('float64')
 
-        self.__init__(old_data, yname=old_yname, prep=old_prep)
-        self.load_modeler(old_modeler)
+    def _save_state(self):
+        """Save initializaiton parameters for future use"""
+
+        saver = dict(data=self.data_.copy(), yname=self.yname, prep=self.prep, modeler=clone(self.modeler))
+        self.saved_state_ = dict(saver)
+
+    def _load_state(self):
+        """Load saved initialization parameters"""
+
+        self.data_ = self.saved_state_['data']
+        self.yname = self.saved_state_['yname']
+        self.prep = self.saved_state_['prep']
+        self.modeler = self.saved_state_['modeler']
 
     def _scale_data(self, input_data):
+        """Subtract mean, divide by standard deviation"""
+
         scaled = input_data.copy()
         scaled = ((scaled - self.scaler['mean']) / self.scaler['std'])
         scaled = scaled.fillna(0)
         return scaled
 
     def load_modeler(self, obj):
+        """Load instantiated sklean.ensemble class"""
+
         self.modeler = clone(obj)
 
-    @staticmethod
-    def bootstrap_pandas(df, nboot, method='arithmetic'):
-        if type(df)==pd.Series:
-            df = df.copy().to_frame()
-        if method=='arithmetic':
-            method = np.mean
-        elif method=='geometric':
-            method = geometric_mean
-        n = df.shape[0]
-        groups = np.repeat(np.arange(nboot), n)
-        boot = np.random.choice(n, n*nboot)
-        out = df.iloc[boot,:].groupby(groups).apply(method)
-        return out.squeeze()
-
     def fit(self, scale=True, seed=None):
-    
+        """Fit a model.
+
+        Args:
+            scale (bool): whether to normalize the data before fitting
+            seed (int, optional): number to seed the pseudo-random number generator
+
+        Returns:
+            None: feature importances are put in a pandas.Series, ordered, and added as a class attribute.
+        """
+
         if scale:
             self.scaler = {'mean': self.data_.mean(), 'std': self.data_.std()}
 
         self.training_data_scaled_ = self._scale_data(self.data_)
         new_data = self.training_data_scaled_.copy()
-        
+
         x_data = new_data.drop([self.yname], axis=1)
         y_data = new_data[self.yname]
-        
+
         if seed is not None:
             np.random.seed(seed)
         _ = self.modeler.fit(X=x_data, y=y_data)
 
         imps = self.modeler.feature_importances_
-        self.feature_importances_ = pd.Series(imps, index=x_data.columns)
-        self.feature_importances_.sort(ascending=False)
+        feature_importances_ = pd.Series(imps, index=x_data.columns).order(ascending=False).to_frame('value')
+        feature_importances_['keep'] = True
+        self.feature_importances_ = feature_importances_
 
     def predict(self, test_data):
-    
-        self.test_data_ = test_data.copy()    
+        """Predict outcome given new data.
+
+        Args:
+            test_data (pandas.DataFrame): new data with same columns/shape as `data_`
+
+        Returns:
+            None: predictions DataFrame is assigned to `predictions_` attribute of class
+
+
+        """
+        self.test_data_ = test_data.copy()
         new_data = self._scale_data(test_data)
         self.test_data_scaled_ = new_data.copy()
-            
-        for_prediction = new_data.drop([self.yname], axis=1)
+
+        if self.yname in new_data.columns.values.tolist():
+            for_prediction = new_data.drop([self.yname], axis=1)
+        else:
+            for_prediction = new_data
         preds = pd.Series(index=for_prediction.index)
         preds.loc[:] = self.modeler.predict(for_prediction)
-        if all([type(x)==pd.Series for x in self.scaler.values()]):            
-            preds = (preds * self.scaler['std'][self.yname]) + \
-                self.scaler['mean'][self.yname]
-            
+        if all([type(x) == pd.Series for x in self.scaler.values()]):
+            preds = (preds * self.scaler['std'][self.yname]) + self.scaler['mean'][self.yname]
+
         actuals = self.test_data_[[self.yname]].copy()
         model_preds = pd.DataFrame(index=preds.index)
         model_preds['predicted'] = preds.astype('float64')
         model_preds['actual'] = actuals.astype('float64')
 
         self.predictions_ = model_preds
-            
-    def simulate(self, predictors, n_inc=100, n_compare=100, multiply=None,
-            var_level='variable', inc_type='actual'):
-        
-        sim_data = self.training_data_scaled_.copy()        
 
-        if multiply is None:
-            mult = int(np.log(len(predictors)))+1
-        else:
-            mult = multiply
-        idx = pd.MultiIndex.from_tuples(predictors, 
-                                        names=self.data_.columns.names)
-        sim_vals = pd.DataFrame(columns=idx)
-        sim_vals_raw = pd.DataFrame(columns=idx)
-        for p in predictors:
-            if inc_type=='actual':
-                sims = np.linspace(sim_data[p].min(), sim_data[p].max(), 
-                                   n_inc).tolist()
-                sims_raw = np.linspace(self.data_[p].min(), self.data_[p].max(), 
-                                   n_inc).tolist()
-            elif inc_type=='quantile':
-                sims = [sim_data[p].quantile(x) for x in 
-                    np.linspace(0, 1, n_inc)]
-                sims_raw = [self.data_[p].quantile(x) for x in 
-                    np.linspace(0, 1, n_inc)]
-            elif inc_type=='random':
-                sims = np.random.choice(sim_data[p], n_inc).tolist()
-                sims_raw = np.random.choice(self.data_[p], n_inc).tolist()
+    def crossvalidate(self, fold_index, **kwargs):
+        """Given an array of inclusion/exclusion flags, train a model, fit predictons to new data.
 
-            sims_ind = np.random.choice(n_inc, n_inc*n_compare*mult)
-            sim_vals[p] = np.array(sims)[sims_ind]
-            sim_vals_raw[p] = np.array(sims_raw)[sims_ind]
-        
-        inds = np.random.choice(sim_data.shape[0], n_inc*n_compare*mult)
-        
-        new_data = sim_data.iloc[inds, :].copy()
-        new_data.loc[:,predictors] = sim_vals.values
-        for_prediction = new_data.drop([self.yname], axis=1)        
-        
-        preds = pd.Series(index=for_prediction.index)
-        preds.loc[:] = self.modeler.predict(for_prediction)
-        if all([type(x)==pd.Series for x in self.scaler.values()]):            
-            preds = (preds * self.scaler['std'][self.yname]) + \
-                self.scaler['mean'][self.yname]
+        Args:
+            fold_index (list, np.array, pandas.Series, or pandas.Index): boolean indicators where training data
+              are flagged True and testing data are flagged False
+            **kwargs: passed to `self.fit`
 
-        output = sim_vals_raw[predictors] 
-        preds = preds.reset_index(drop=True).to_frame('predicted')
-        output = output.reset_index(drop=True)
-        
-        if type(output.columns) == pd.MultiIndex:
-            stack_levels = [x for x in output.columns.names if x!=var_level]
-            output = output.stack(stack_levels).reset_index(stack_levels)
-        else:
-            stack_levels = []
-        
-        output = pd.merge(output, preds, how='outer', left_index=True, 
-                          right_index=True)
-        output = output.reset_index(drop=True)
-        output.columns.names = ['variable']
-        output = output.set_index(stack_levels+['predicted'])
-        output = output.stack().to_frame('value')
-        output = output.reset_index()
-    
-        return output
-    
-    def crossvalidate(self, fold_index, scale=True, seed=None):
+        Returns:
+            Object: a copy of the class containing the cross-validation data, model, and predictions
+
+
+        """
+
         self._save_state()
-        train = self.data_.loc[fold_index,:].copy()
-        test = self.data_.loc[~fold_index,:].copy()
+        train = self.data_.loc[fold_index, :].copy()
+        test = self.data_.loc[~fold_index, :].copy()
         self.data_ = train
-        self.fit(scale=scale, seed=seed)
+        self.fit(**kwargs)
         self.predict(test)
         self._load_state()
         return copy.deepcopy(self)
 
-    def kfold(self, nfolds=10, **kwargs):
+    def kfold(self, k=10, **kwargs):
+        """Perform cross-validation on k randomly-partitioned sections of self.data_
+
+        Args:
+            k (int): number of folds to generate
+            **kwargs: passed to crossvalidate, which passes them to fit
+
+        Returns
+            None: list of cross-validation results is stored in `self.kfold_results_` plus pandas.DataFrame of
+                k-fold predictions in `kfold_predictions_`
+
+
+        """
 
         self.kfold_results_ = None
 
         n = self.data_.shape[0]
-        reps = (n//nfolds)+1
-        folds = np.repeat(range(nfolds), reps)[:n]
+        reps = (n//k)+1
+        folds = np.repeat(range(k), reps)[:n]
         folds = np.random.permutation(folds)
-        fold_list = [self.crossvalidate(folds!=fold, **kwargs) for fold in 
-            np.unique(folds)]
-    
-        self.kfold_results_ = fold_list
+        fold_list = [self.crossvalidate(folds != fold, **kwargs) for fold in np.unique(folds)]
 
-    def model_performance(self, verbose=True):
-        
+        self.kfold_results_ = fold_list
         preds = pd.concat([x.predictions_ for x in self.kfold_results_])
         self.kfold_predictions_ = preds.copy()
 
-        if verbose:
-            preds = preds[['actual', 'predicted']]            
-            kfold_preds = pd.DataFrame(columns=['pearson', 'kendall'], index=[0])
-            kfold_preds['pearson'] = preds.corr().iloc[0,1]
-            kfold_preds['kendall'] = preds.corr(method='kendall').iloc[0,1]
-            kfold_preds['amean_abs'] = preds.T.diff().abs().T.iloc[:,1].mean()
-            kfold_preds['gmean_abs'] = np.exp(np.log(preds.T.diff().abs(
-                ).T.iloc[:,1]+1).mean())-1
-            kfold_preds['median_abs'] = preds.T.diff().abs(
-                ).T.iloc[:,1].median()
-            kfold_preds['amean_pct'] = preds.T.pct_change().abs(
-                ).T.iloc[:,1].replace({np.inf:np.nan, -np.inf:np.nan}).mean()
-            kfold_preds['gmean_pct'] = np.exp(np.log(preds.T.pct_change().abs(
-                ).T.iloc[:,1].replace({np.inf:np.nan, -np.inf:np.nan})+1).mean()
-                )-1
-            kfold_preds['median_pct'] = preds.T.pct_change().abs(
-                ).T.iloc[:,1].replace({np.inf:np.nan, -np.inf:np.nan}).median()
-            slope = LinearRegression().fit(
-                X=preds[['predicted']], y=preds['actual']).coef_[0]
-            kfold_preds['slope'] = slope
+    def select_features(self, k=2, boundary=100, minimum=2, sensitivity=2, **kwargs):
+        """Select features based on k-fold cross validation, using median absolute percent error as a loss function
 
-            return kfold_preds
+        Args:
+            k (int): number of folds
+            boundary (int): if number of features chosen after first pass is greater than boundary, second pass
+                will explore every number between the first-pass results and first-pass results / 2; otherwise, it
+                will explore every number between first-pass results and 1
+            minimum (int): minimum number of features to include
+            sensitivity (int): how many decimal places to consider when comparing loss function results
+            **kwargs: passed to `kfold`, which is passed to `cross_validate`, which is passed to `fit`
 
-    def _get_tree_importances(self, models, combine=False):
-    
-        try:
-            outputs = [est.feature_importances_ for hold in 
-                models.estimators_ for est in hold]
-        except:
-            outputs = [est.feature_importances_ for est in 
-                models.estimators_]
+        Returns:
+            None: 'keep' column of `feature_importances_` is ammended to only be True for selected variables
 
-        out = pd.DataFrame(np.column_stack(outputs).T, 
-                columns=self.data_.drop([self.yname], axis=1).columns)        
 
-        return out
-        
-    def select_features(self, rimp_threshold=0.01, imp_threshold=None, 
-                        droplevel=None):
+        """
 
+        to_replace = [np.inf, -np.inf, 0.]
+        imps = self.feature_importances_.copy()
+        n = imps.shape[0]
+        ns = []
         self._save_state()
-        features = self.feature_evaluations_.copy()
-        keep = np.ones(features.shape[0], dtype=np.bool)
-        if rimp_threshold is not None:
-            keep[features['relative_importance'].values<rimp_threshold] = False
-        if imp_threshold is not None:
-            keep[features['mean_importance'].values<imp_threshold] = False
-        
-        keepers = features.index[keep]
-        
-        if droplevel is not None:
-            original_items = features.index
-            all_items = original_items            
+        saved_data = self.saved_state_['data'].copy()
+        while n > minimum:
+            keep = [self.yname] + imps.head(n).index.values.tolist()
+            self.data_ = self.data_[keep]
+            self.kfold(k=k, **kwargs)
+            preds = self.kfold_predictions_.copy()
+            loss_mean = ((preds['predicted'] / preds['actual']) - 1).replace(to_replace, np.nan).abs().median()
+            ns.append((n, loss_mean))
+            #print n, round(loss_mean, 4)
+            n = int(n/2)
 
-            for l in droplevel:
-                all_items = all_items.droplevel(l)
-                keepers = keepers.droplevel(l)
-            keep = np.array([True if x in keepers else False for x in all_items])
-            keepers = features.index[keep]
-                    
-        new_data = self.data_.loc[:,keepers].copy()
-        new_data[self.yname] = self.data_[self.yname].copy()
-        self.load_state()
+        self.saved_state_['data'] = saved_data.copy()
+        self._load_state()
 
-    @staticmethod
-    def quantile_lift(data, n=10, metric=sum, plot=False):
-        original = data['actual'].copy()
-        predicted = data['predicted'].copy()
-        q = 1.0/n
-        qs = np.arange(0.0, 1.0+q, q)
-        levels = [original.quantile(x) for x in qs[1:-1]]
-        levels = [-np.inf] + levels + [np.inf]
-        grouper = pd.cut(original, bins=levels, labels=qs[1:].astype(str))
-        output= pd.DataFrame()
-        output['actual'] = original.groupby(grouper).apply(metric)
-        output['predicted'] = predicted.groupby(grouper).apply(metric)
-        if plot:
-            output.plot()
-        return output
-    
+        n_ind = pd.Series([x[1] for x in ns]).pct_change().argmin() - 1
+        max_n = pd.Series([x[0] for x in ns])[n_ind] + 1
+        min_n = minimum if max_n < boundary else max_n/2.0
+
+        ns = []
+        for n in range(min_n, max_n)[::-1]:
+            keep = [self.yname] + imps.head(n).index.values.tolist()
+            self.data_ = self.data_[keep]
+            self.kfold(k=k, **kwargs)
+            preds = self.kfold_predictions_.copy()
+            loss_mean = ((preds['predicted'] / preds['actual']) - 1).replace(to_replace, np.nan).abs().median()
+            ns.append((n, loss_mean))
+            #print n, round(loss_mean, 4)
+
+        self.saved_state_['data'] = saved_data.copy()
+        self._load_state()
+
+        keep_n = pd.Series([x[1] for x in ns]).round(sensitivity).argmin()
+        keep_n = pd.Series([x[0] for x in ns])[keep_n]
+
+        imps.ix[keep_n:, 'keep'] = False
+        self.feature_importances_ = imps.copy()
+
+    def filter_data(self, new_data=None):
+        """Given `feature_importances_`, keep only outcome and selected features in `data_`"""
+
+        imps = self.feature_importances_.copy()
+        keep = [self.yname] + imps[imps['keep']].index.values.tolist()
+
+        if new_data is None:
+            self.data_ = self.data_[keep].copy()
+        else:
+            return new_data[keep].copy()
+
+    def simulate(self, predictors=None, n_inc=100, n_compare=100):
+        """Simulate response of outcome variable to changes in each predictor, holding everything else constant.
+
+        Args:
+            predictors (list, optional): list of predictors for which to calculate coefficients, all predictors in
+                `data_` used if none fed to method
+            n_inc (int): number of evenly-spaced increments in the outcome variable to use for the simulation
+            n_compare (int): number of comparisons to make for each increment
+
+        Returns:
+            simulations_ (pandas.DataFrame):
+            coefficients_ (pandas.DataFrame):
+
+
+        """
+
+        predictors = self.data_.drop([self.yname], axis=1).columns.values.tolist() if predictors is None else predictors
+        sim_data = self.training_data_scaled_.copy()
+
+        output_dfs = []
+        boots = []
+        for p in predictors:
+            sims = np.linspace(sim_data[p].min(), sim_data[p].max(), n_inc)
+            others = [pred for pred in predictors if pred != p]
+            weights = [make_weights(sim_data[p], (sims < s).mean()) for s in sims]
+            other_vals = [[np.random.choice(sim_data[o], size=n_compare, p=w) for o in others] for w in weights]
+            other_vals = np.concatenate([np.column_stack(vals) for vals in other_vals], axis=0)
+
+            idx = pd.MultiIndex.from_tuples(others, names=self.data_.columns.names)
+            sim_vals = pd.DataFrame(other_vals, columns=idx)
+            sim_vals[p] = sims.tolist() * n_compare
+            sim_vals = sim_vals[predictors]
+            sim_vals = sim_vals.sort([p])
+
+            predictor = sim_vals[p].copy()
+            preds = pd.Series(index=sim_vals.index)
+            preds.loc[:] = self.modeler.predict(sim_vals)
+
+            #plt.plot(predictor, preds, '.')
+            #plt.show()
+
+            boot_output = pd.Series()
+            boot = []
+            for i in range(n_compare):
+                resample = np.random.choice(predictor.shape[0], predictor.shape[0])
+                x = predictor.to_frame('p').iloc[resample, :]
+                y = preds.iloc[resample]
+                slope = LinearRegression().fit(X=x, y=y).coef_[:][0]
+                boot.append(slope)
+            boot_output['smean'] = pd.Series(boot).mean()
+            boot_output['sstd'] = pd.Series(boot).std()
+            check = preds.groupby(predictor).mean()
+            boot_output['soffset'] = LinearRegression().fit(X=check.to_frame('p'), y=check.index.values).coef_[:][0]
+
+            if all([type(x) == pd.Series for x in self.scaler.values()]):
+                preds = (preds * self.scaler['std'][self.yname]) + self.scaler['mean'][self.yname]
+                predictor = (predictor * self.scaler['std'][p]) + self.scaler['mean'][p]
+            output = pd.DataFrame(index=sim_vals.index)
+            output['outcome'] = preds
+            output['value'] = predictor
+            index_names = sim_vals.columns.names + ['increment', 'simulation']
+            increment = np.tile(range(n_inc), n_compare)
+            simulation = np.repeat(range(n_compare), n_inc)
+            output_index = [p + (increment[j], ) + (simulation[j], ) for j in range(len(increment))]
+            output_index = pd.MultiIndex.from_tuples(output_index, names=index_names)
+            output.index = output_index
+
+            boot = []
+            for i in range(n_compare):
+                resample = np.random.choice(predictor.shape[0], predictor.shape[0])
+                x = predictor.to_frame('p').iloc[resample, :]
+                y = preds.iloc[resample]
+                slope = LinearRegression().fit(X=x, y=y).coef_[:][0]
+                boot.append(slope)
+            boot_output['rmean'] = pd.Series(boot).mean()
+            boot_output['rstd'] = pd.Series(boot).std()
+            check = preds.groupby(predictor).mean()
+            boot_output['roffset'] = LinearRegression().fit(X=check.to_frame('p'), y=check.index.values).coef_[:][0]
+
+            output_dfs.append(output.copy())
+            boots.append(boot_output.copy())
+
+        output_dfs = pd.concat(output_dfs, axis=0)
+        boots = pd.concat(boots, axis=1, keys=predictors).T
+        boots.index = pd.MultiIndex.from_tuples(boots.index.values, names=self.data_.columns.names)
+        boots['importance'] = self.feature_importances_[self.feature_importances_['keep']]['value']
+
+        self.simulations_ = output_dfs
+        self.coefficients_ = boots
+
+    def empirical_error(self, predictions=None, cv_preds=None, cv_actuals=None, n=1000, q=None):
+        """Calculate prediction errors based on cross-validation errors.
+
+        Args:
+            predictions (pd.Series, optional): predictions from model; taken from `predictions_` if None
+            cv_preds (pandas.Series, optional): predictions from cross validation; taken from kfold_predictions_ if None
+            cv_actuals (pandas.Series, optional): values from cross validation; taken from kfold_predictions_ if None
+            n (int): number of error metrics to randomly sample
+            q (float, optional): probability for which to calculate credibile interval
+
+        Returns:
+
+            None: if q is None, assigns data frame with estimates and all errors to `errors_`;
+                if q is not None, assigns estimates and credible interval boundaries to `error_estimates_`
+
+
+        """
+
+        return_output = predictions is not None
+        cv_preds = self.kfold_predictions_['predicted'].copy() if cv_preds is None else cv_preds
+        cv_actuals = self.kfold_predictions_['actual'].copy() if cv_actuals is None else cv_actuals
+        predictions = self.predictions_['predicted'].copy() if predictions is None else predictions
+
+        # calculate ratio of predicted and actual
+        diffs = cv_preds.astype(float) / cv_actuals.astype(float)
+        diffs = pd.Series(diffs).replace([np.inf, -np.inf, 0.0], np.nan).dropna().values
+
+        # scale predictions by randomly-selected error ratios
+        error_list = [p * np.array(sorted(np.random.choice(diffs, n))) for p in predictions]
+        errors = np.column_stack(error_list)
+        idx = predictions.index if hasattr(predictions, 'index') else range(errors.shape[1])
+        errors = pd.DataFrame(errors, columns=idx)
+        if not return_output:
+            self.errors_ = errors
+
+        if q is not None:
+            for prob in q:
+                output = pd.DataFrame({'estimate': predictions})
+                p = (1.0 - prob) / 2
+                output['lwr' + '{:0.0f}'.format(prob*100).replace('0.', '')] = errors.quantile(0.0 + p)
+                output['upr' + '{:0.0f}'.format(prob*100).replace('0.', '')] = errors.quantile(1.0 - p)
+            if not return_output:
+                self.error_estimates_ = output.copy()
+        if return_output:
+            return (output, errors) if q is not None else errors
+
 
 class ProductSpace(object):
     def __init__(self, data, products, geographies, value_var, year_var=None):
@@ -706,12 +1085,14 @@ class ProductSpace(object):
         return output
         
     def reshape(self, method='division', cutoff='auto', **kwargs):
-        '''
-        method: 'division' or 'lowess'
-        cutoff: threshold for binarizing reults of transforming self.value_var
-        by method
-        kwargs: passed to smoother.lowess
-        '''
+        """
+        Args:
+            method: 'division' or 'lowess'
+            cutoff: threshold for binarizing reults of transforming self.value_var by method
+            **kwargs: passed to smoother.lowess
+
+
+        """
         
         data = self.original_data.copy()
         share_vars = self.geography_vars[:]
@@ -818,70 +1199,12 @@ class ProductSpace(object):
         
         return n, proximity, density
 
-def empirical_error(test, train_predict, train_actual, n=1000, q=None, 
-                    lower_bound=None, **kwargs):
 
-    # calculate difference between predicted and actual
-    diffs = train_actual.astype(float) - train_predict.astype(float)
-    if type(diffs)==pd.Series:
-        diffs = diffs.values
-    if type(train_actual)==pd.Series:
-        actuals = train_actual.values
-    else:
-        actuals = train_actual
-
-    error_list = []
-    for t in test:
-        # calculate absolute ratio of test to actuals
-        shift = 0.0
-        if t==0.0:
-            ratio = np.abs((t+1.0)/(actuals+1.0))            
-        else:            
-            ratio = np.abs((t+shift)/(actuals+shift))
-            shift = shift + 1
-        ratio[np.isnan(ratio)] = np.abs((t+shift)/(actuals+shift))[np.isnan(ratio)]
-        ratio[np.isinf(ratio)] = np.abs((t+shift)/(actuals+shift))[np.isinf(ratio)]
-        
-        #scale actual differences by ratio, then add to test (optional cutoff)
-        scaled_diffs = diffs*ratio
-        candidate = t + scaled_diffs
-        if lower_bound is not None:
-            candidate[candidate<lower_bound] = lower_bound
-
-        # randomly select n errors, then sort
-        errors = np.random.choice(candidate, n)
-        errors.sort()
-        error_list.append(errors)
-    
-    errors = np.column_stack(error_list)
-    try:
-        idx = test.index
-    except:
-        idx = range(errors.shape[1])
-    errors = pd.DataFrame(errors, columns=idx)
-    output = pd.DataFrame({'estimate':test})
-    if q is None:
-        output = pd.concat([output, errors.T], axis=1)
-        output = output.set_index(['estimate'], append=True)
-        output.columns.names = ['simulation']
-        output = output.stack().to_frame('error').reset_index(
-            ['estimate', 'simulation'])
-    else:
-        for prob in q:
-            output['q_'+str(errors)] = errors.quantile(errors)
-    
-    return output
-
-def corr_data(data, i, value_var, time_var, index_vars, min_time=None, t=None,
-              weight=False, fill=True, return_df=True):
+def corr_data(data, i, value_var, time_var, index_vars, min_time=None, t=None, weight=False, fill=True, return_df=True):
     t0 = time.time()
     print 'shaping data sets...'
     
-    if min_time is None:
-        min_t = data[time_var].max()
-    else:
-        min_t = min_time
-        
+    min_t = data[time_var].max() if min_time is None else min_time
     df = data.set_index(index_vars+[time_var])[value_var].unstack(index_vars)
     output_df = df.T.stack().to_frame(value_var).reset_index()
     output_df = output_df.set_index(index_vars+[time_var])
@@ -912,18 +1235,18 @@ def corr_data(data, i, value_var, time_var, index_vars, min_time=None, t=None,
         jaccard = pd.DataFrame(jaccard, columns=corrs.columns, index=corrs.index)
     
     print 'filtering correlations...'
-    corrs = corrs.iloc[:col_ind,(col_ind+1):]
+    corrs = corrs.iloc[:col_ind, (col_ind+1):]
     corrs = corrs.fillna(0)
     if weight:
-        jaccard = jaccard.iloc[:col_ind,(col_ind+1):]
+        jaccard = jaccard.iloc[:col_ind, (col_ind+1):]
         jaccard = 1 - jaccard
-        corrs = corrs * jaccard
+        corrs *= jaccard
     column_names = [str(x)+'_compare' for x in corrs.columns.names]
     corrs.columns.names = column_names
     
     if t is not None:        
         corrs = corrs.stack(column_names)
-        corrs = corrs[corrs>=t].sort_index()
+        corrs = corrs[corrs >= t].sort_index()
         corrs = corrs.unstack(column_names)
 
     print 'total time:', time.time() - t0
@@ -936,6 +1259,7 @@ from sklearn.decomposition import KernelPCA
 from sklearn.cluster import AffinityPropagation
 import matplotlib.pyplot as plt
 
+
 def get_continuity_start(arr, rounder=None):
     d = arr.values
     d = np.diff(d)
@@ -944,12 +1268,12 @@ def get_continuity_start(arr, rounder=None):
     out = []
     j = 0
     for i in range(1, len(d)):
-        if d[i-1]!=d[i]:
+        if d[i-1] != d[i]:
             j = i
         out.append(j)
     
     s = pd.Series(out).value_counts()
-    if s.iloc[0]==1:
+    if s.iloc[0] == 1:
         print 'no good choice'
     else:
         return arr.index[s.index[0]]
@@ -957,17 +1281,17 @@ def get_continuity_start(arr, rounder=None):
 def percent_majority(x):
     signed = np.sign(x)
     top = np.sign(x).astype(str).describe().T['top'].astype(float)
-    percent = (signed!=top).sum()
+    percent = (signed != top).sum()
     return percent
 
 def affinity_propagation(df, weights=None, rounder=3, output='object', 
                          verbose=False):
-    if type(df)==pd.DataFrame:
+    if type(df) == pd.DataFrame:
         df1 = df.values
     else:
         df1 = df
     dists = pairwise_distances(df1).flatten()**2
-    dists = dists[dists>0.0]
+    dists = dists[dists > 0.0]
     inputs = np.linspace(-np.median(dists)/2, -dists.min(), 101)[:-1]
     ds = np.arange(0.5, 1.0-0.01, .01)
 
@@ -977,8 +1301,7 @@ def affinity_propagation(df, weights=None, rounder=3, output='object',
     for d in ds:
         if verbose:
             print d, 
-        km = AffinityPropagation(preference=inputs[0], damping=d, 
-                                 convergence_iter=30, max_iter=400)
+        km = AffinityPropagation(preference=inputs[0], damping=d, convergence_iter=30, max_iter=400)
         x = km.fit(df1) 
         labels = pd.Series(km.labels_).value_counts(normalize=True).sort_index()
         maxs = df.groupby(km.labels_).max() 
@@ -1035,30 +1358,28 @@ def affinity_propagation(df, weights=None, rounder=3, output='object',
         counts.append(percents)
         n.append(labels.shape[0])
 
-    out = pd.DataFrame({'mean_range':out, 'total_count':counts, 'n_groups':n}, 
-                       index=inputs)
+    out = pd.DataFrame({'mean_range': out, 'total_count': counts, 'n_groups': n}, index=inputs)
     
     min_ind = get_continuity_start(out['n_groups'].pct_change(),rounder)
-    max_ind = (out.loc[min_ind:,'n_groups'].pct_change().dropna().abs().round(rounder)!=0.0).argmax()
-    pref = out.loc[min_ind:max_ind,:].iloc[:-1,:]
+    max_ind = (out.loc[min_ind:, 'n_groups'].pct_change().dropna().abs().round(rounder) != 0.0).argmax()
+    pref = out.loc[min_ind:max_ind, :].iloc[:-1, :]
     if len(pref)==0:
         print ''
         print 'mean_corr and n_mult criteria exclude all possibilities'
         return out
     else: 
-        pref = pref[pref['total_count']==pref['total_count'].min()].index[0]
+        pref = pref[pref['total_count'] == pref['total_count'].min()].index[0]
     
-    if output=='object':
-        km = AffinityPropagation(preference=pref, damping=damp, 
-                                 convergence_iter=30, max_iter=400)
+    if output == 'object':
+        km = AffinityPropagation(preference=pref, damping=damp, convergence_iter=30, max_iter=400)
         x = km.fit(df1) 
         return km
     else:
         return damps, out, damp, pref
 
-def principal_components(data, idx, val, kernel='linear', cluster=True,
-                         components=None, sensitivity=3, verbose=False,
-                         output_dict=None):
+
+def principal_components(
+        data, idx, val, kernel='linear', cluster=True, components=None, sensitivity=3, verbose=False, output_dict=None):
     try:
         df = data[val].unstack(idx).fillna(0).T
     except:
@@ -1090,9 +1411,9 @@ def principal_components(data, idx, val, kernel='linear', cluster=True,
     output = loadings.copy()
     
     if cluster:
-        ap = affinity_propagation(df=loadings[load_cols], 
-            weights=variance_explained['total'][load_cols].values, 
-            rounder=sensitivity, verbose=verbose)
+        ap = affinity_propagation(
+            df=loadings[load_cols], weights=variance_explained['total'][load_cols].values, rounder=sensitivity,
+            verbose=verbose)
         output['cluster'] = ap.labels_
 
         if output_dict is not None:
@@ -1101,7 +1422,7 @@ def principal_components(data, idx, val, kernel='linear', cluster=True,
             cat_dict = cat_dict.to_dict()
             cat_dict = {k:v.tolist() for k,v in cat_dict.items()}
         
-    class final(object):
+    class Final(object):
         correlation = df.copy()
         diagnostic = variance_explained
         pca_object = sp
@@ -1109,21 +1430,18 @@ def principal_components(data, idx, val, kernel='linear', cluster=True,
         loading = output
         cluster_dictionary = cat_dict
     
-    final_output = final()
+    final_output = Final()
     
     return final_output
-        
+
+
 def plot_components(loadings, labels=None, components=None):
     loads = loadings.copy()
     if labels is not None:
         loads['cluster'] = labels
 
-    if components is not None:
-        x_lab = components[0]
-        y_lab = components[1]
-    else:
-        x_lab = 1
-        y_lab = 2
+    x_lab = components[0] if components is not None else 1
+    y_lab = components[1] if components is not None else 2
 
     if labels is None:
         plt.plot(loadings[x_lab], loadings[y_lab], '.')
@@ -1142,6 +1460,7 @@ def plot_components(loadings, labels=None, components=None):
             x = plt.text(loads.loc[i, x_lab], loads.loc[i, y_lab], 
                 str(int(loads.loc[i,'cluster'])), fontdict={'size': 6})
     plt.show()
+
 
 def plot_correlations(corr, loadings, component=1, cmap='RdBu',
                           tick_level=None):
