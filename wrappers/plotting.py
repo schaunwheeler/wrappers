@@ -17,6 +17,7 @@ import bokeh.plotting
 import bokeh.colors
 import os
 from collections import OrderedDict
+from itertools import izip_longest
 
 DSTYPE = bokeh.objects.ColumnDataSource
 
@@ -461,14 +462,8 @@ def change_axes(**kwargs):
     if p is None: 
         return None
 
-    try:
-        axes = bokeh.plotting.axis()
-        x_axis = [axes[0]]
-        y_axis = [axes[1]]
-    except:
-        axis_obj = bokeh.objects.Axis
-        x_axis = [obj for obj in p.above + p.below if isinstance(obj, axis_obj)]
-        y_axis = [obj for obj in p.left + p.right if isinstance(obj, axis_obj)]
+    x_axis = bokeh.plotting.xaxis()
+    y_axis = bokeh.plotting.yaxis()
 
     xtags = sum([1 if k.startswith('x_') else 0 for k in kwargs.keys()])
     ytags = sum([1 if k.startswith('y_') else 0 for k in kwargs.keys()])
@@ -476,18 +471,22 @@ def change_axes(**kwargs):
     if xtags > 0:
         xs = [(k[2:], v) for k, v in kwargs.items() if k.startswith('x_')]
         for k, v in xs:
-            x_axis[0].__setattr__(k, v)
+            for i in range(len(x_axis)):
+                x_axis[i].__setattr__(k, v)
     if ytags > 0:
         ys = [(k[2:], v) for k, v in kwargs.items() if k.startswith('y_')]
         for k, v in ys:
-            y_axis[0].__setattr__(k, v)
+            for i in range(len(y_axis)):
+                y_axis[i].__setattr__(k, v)
 
     if (xtags + ytags) < len(kwargs):
         boths = [(k, v) for k, v in kwargs.items() if (k.startswith('x_')+k.startswith('y_')) == 0]
         for k, v in boths:
-            x_axis[0].__setattr__(k, v)
-            y_axis[0].__setattr__(k, v)
-            
+            for i in range(len(x_axis)):
+                x_axis[i].__setattr__(k, v)
+            for i in range(len(y_axis)):
+                y_axis[i].__setattr__(k, v)
+
     bind = x_axis+y_axis
     return bind
 
@@ -503,6 +502,13 @@ def set_hover(values):
     hover = [t for t in bokeh.plotting.curplot().tools if isinstance(t, bokeh.objects.HoverTool)][0]
     hover.tooltips = OrderedDict(values)
     return hover
+
+
+def facet_wrap(plots, ncol, name=None):
+    args = [iter(plots)] * ncol
+    plot_list = izip_longest(fillvalue=None, *args)
+    plot_list = [[y for y in x if y is not None] for x in plot_list]
+    return bokeh.plotting.gridplot(plot_list, name=name)
 
 
 def create_gradient(values, low, high, mid=None, val_range=None, intervals=100):

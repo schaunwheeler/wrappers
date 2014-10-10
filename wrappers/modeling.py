@@ -17,6 +17,8 @@ from scipy.cluster.hierarchy import dendrogram, fcluster
 from sklearn.metrics.pairwise import pairwise_distances
 import statsmodels.nonparametric.smoothers_lowess as smoother
 import time
+from sklearn.decomposition import KernelPCA
+from sklearn.cluster import AffinityPropagation
 
 
 class Cluster(object):
@@ -664,20 +666,23 @@ class Ensemble(object):
 
     """
 
-    def __init__(self, data, yname, prep=False):
+    def __init__(self, data, yname, modeler, scale=True, seed=None, prep=False):
         """Load data and set up basic model parameters
 
         Args:
             data (pandas.DataFrame): the data to train the model
             yname (str): the name of the column representing the outcome variable
             prep (bool): whether to ensure the dataset has only float values in it
+            scale (bool): whether to normalize the data
+            seed (int): passed to numpy.random.seed
 
         Attributes:
             data_ (pandas.DataFrame): the data, ready for analysis
             prep (bool): flag to remember initialization settings
             yname (str): name of outcome variable
             scaler (dict): initial mean and standard error for scaling data (defaults to no scaling)
-            modeler (sklearn.ensemble): model class from sklearn
+            selection_modeler (sklearn.ensemble): model class from sklearn to use for feature selection
+            validation_modeler (sklearn.ensemble): model class from sklearn to use for model validation
             feature_importances_ (pandas.Series): feature importance scores from a fit model
             training_data_scaled_ (pandas.DataFrame): normalized data_
             test_data_ (pandas.DataFrame): new data for which to predict outcomes
@@ -694,10 +699,17 @@ class Ensemble(object):
         """
 
         self.data_ = data.copy()
+        self.seed = seed
+        self.scale = scale
         self.prep = prep
         self.yname = yname
         self.scaler = {'mean': 0, 'std': 1}
-        self.modeler = None
+        if type(modeler) == tuple:
+            self.selection_modeler = clone(modeler[0])
+            self.validation_modeler = clone(modeler[1])
+        else:
+            self.selection_modeler = clone(modeler)
+            self.validation_modeler = clone(modeler)
         self.feature_importances_ = pd.Series()
         self.training_data_scaled_ = pd.DataFrame()
         self.test_data_ = pd.DataFrame()
@@ -719,7 +731,9 @@ class Ensemble(object):
     def _save_state(self):
         """Save initializaiton parameters for future use"""
 
-        saver = dict(data=self.data_.copy(), yname=self.yname, prep=self.prep, modeler=clone(self.modeler))
+        saver = dict(
+            data=self.data_.copy(), yname=self.yname, prep=self.prep, selection_modeler=clone(self.selection_modeler),
+            validation_modeler=clone(self.validation_modeler))
         self.saved_state_ = dict(saver)
 
     def _load_state(self):
@@ -728,7 +742,8 @@ class Ensemble(object):
         self.data_ = self.saved_state_['data']
         self.yname = self.saved_state_['yname']
         self.prep = self.saved_state_['prep']
-        self.modeler = self.saved_state_['modeler']
+        self.selection_modeler = self.saved_state_['selection_modeler']
+        self.validation_modeler = self.saved_state_['validation_modeler']
 
     def _scale_data(self, input_data):
         """Subtract mean, divide by standard deviation"""
@@ -738,23 +753,19 @@ class Ensemble(object):
         scaled = scaled.fillna(0)
         return scaled
 
-    def load_modeler(self, obj):
-        """Load instantiated sklean.ensemble class"""
-
-        self.modeler = clone(obj)
-
-    def fit(self, scale=True, seed=None):
+    def fit(self, modeler='validation'):
         """Fit a model.
 
         Args:
-            scale (bool): whether to normalize the data before fitting
-            seed (int, optional): number to seed the pseudo-random number generator
+            modeler (str): which modeler to use
 
         Returns:
             None: feature importances are put in a pandas.Series, ordered, and added as a class attribute.
         """
 
-        if scale:
+        modeler = self.validation_modeler if modeler == 'validation' else self.selection_modeler
+
+        if self.scale:
             self.scaler = {'mean': self.data_.mean(), 'std': self.data_.std()}
 
         self.training_data_scaled_ = self._scale_data(self.data_)
@@ -763,16 +774,16 @@ class Ensemble(object):
         x_data = new_data.drop([self.yname], axis=1)
         y_data = new_data[self.yname]
 
-        if seed is not None:
-            np.random.seed(seed)
-        _ = self.modeler.fit(X=x_data, y=y_data)
+        if self.seed is not None:
+            np.random.seed(self.seed)
+        _ = modeler.fit(X=x_data, y=y_data)
 
-        imps = self.modeler.feature_importances_
+        imps = modeler.feature_importances_
         feature_importances_ = pd.Series(imps, index=x_data.columns).order(ascending=False).to_frame('value')
         feature_importances_['keep'] = True
         self.feature_importances_ = feature_importances_
 
-    def predict(self, test_data):
+    def predict(self, test_data, modeler='validation'):
         """Predict outcome given new data.
 
         Args:
@@ -783,6 +794,8 @@ class Ensemble(object):
 
 
         """
+
+        modeler = self.validation_modeler if modeler == 'validation' else self.selection_modeler
         self.test_data_ = test_data.copy()
         new_data = self._scale_data(test_data)
         self.test_data_scaled_ = new_data.copy()
@@ -792,7 +805,7 @@ class Ensemble(object):
         else:
             for_prediction = new_data
         preds = pd.Series(index=for_prediction.index)
-        preds.loc[:] = self.modeler.predict(for_prediction)
+        preds.loc[:] = modeler.predict(for_prediction)
         if all([type(x) == pd.Series for x in self.scaler.values()]):
             preds = (preds * self.scaler['std'][self.yname]) + self.scaler['mean'][self.yname]
 
@@ -803,7 +816,7 @@ class Ensemble(object):
 
         self.predictions_ = model_preds
 
-    def crossvalidate(self, fold_index, **kwargs):
+    def crossvalidate(self, fold_index, ahead=None, modeler='validation', **kwargs):
         """Given an array of inclusion/exclusion flags, train a model, fit predictons to new data.
 
         Args:
@@ -820,13 +833,22 @@ class Ensemble(object):
         self._save_state()
         train = self.data_.loc[fold_index, :].copy()
         test = self.data_.loc[~fold_index, :].copy()
+
+        if (train.std() == 0.0).any():
+            zeros = (train == 0.0).values
+            np.random.seed(self.seed)
+            np.place(train.values, zeros, np.random.normal(0.0, 0.0000000001, zeros.sum()))
+
+        if ahead is not None:
+            test = test.iloc[[ahead], :]
+
         self.data_ = train
-        self.fit(**kwargs)
-        self.predict(test)
+        self.fit(modeler=modeler, **kwargs)
+        self.predict(test, modeler=modeler)
         self._load_state()
         return copy.deepcopy(self)
 
-    def kfold(self, k=10, **kwargs):
+    def kfold(self, k=10, modeler='validation', **kwargs):
         """Perform cross-validation on k randomly-partitioned sections of self.data_
 
         Args:
@@ -843,25 +865,32 @@ class Ensemble(object):
         self.kfold_results_ = None
 
         n = self.data_.shape[0]
-        reps = (n//k)+1
-        folds = np.repeat(range(k), reps)[:n]
-        folds = np.random.permutation(folds)
-        fold_list = [self.crossvalidate(folds != fold, **kwargs) for fold in np.unique(folds)]
+
+        if k < 0:
+            fold_indices = [np.arange(n) < i for i in np.arange(3, n + k - 1)]
+            ahead = -k
+        else:
+            reps = (n // k) + 1
+            folds = np.repeat(range(k), reps)[:n]
+            np.random.seed(self.seed)
+            folds = np.random.permutation(folds)
+            fold_indices = [folds != fold for fold in np.unique(folds)]
+            ahead = None
+
+        fold_list = [self.crossvalidate(idx, ahead=ahead, modeler=modeler, **kwargs) for idx in fold_indices]
 
         self.kfold_results_ = fold_list
         preds = pd.concat([x.predictions_ for x in self.kfold_results_])
         self.kfold_predictions_ = preds.copy()
 
-    def select_features(self, k=2, boundary=100, minimum=2, sensitivity=2, **kwargs):
-        """Select features based on k-fold cross validation, using median absolute percent error as a loss function
+    def select_features(self, k=2, sensitivity=3, imp_boundary=None, **kwargs):
+        """Select features based on k-fold cross validation, using median absolute percent error weighted by pearson
+         correlatino coefficient as a loss function
 
         Args:
             k (int): number of folds
-            boundary (int): if number of features chosen after first pass is greater than boundary, second pass
-                will explore every number between the first-pass results and first-pass results / 2; otherwise, it
-                will explore every number between first-pass results and 1
-            minimum (int): minimum number of features to include
-            sensitivity (int): how many decimal places to consider when comparing loss function results
+            sensitivity (int): how many decimal places should be considered
+            imp_boundary (float):
             **kwargs: passed to `kfold`, which is passed to `cross_validate`, which is passed to `fit`
 
         Returns:
@@ -870,46 +899,61 @@ class Ensemble(object):
 
         """
 
-        to_replace = [np.inf, -np.inf, 0.]
         imps = self.feature_importances_.copy()
-        n = imps.shape[0]
-        ns = []
-        self._save_state()
-        saved_data = self.saved_state_['data'].copy()
-        while n > minimum:
-            keep = [self.yname] + imps.head(n).index.values.tolist()
+        to_replace = [np.inf, -np.inf, 0.]
+        min_n = 1
+
+        if type(imp_boundary) == int:
+            max_n = imp_boundary if imp_boundary <= imps.shape[0] else imps.shape[0]
+        elif imp_boundary < 0:
+            vals = imps['value']
+            vals = [vals.iloc[i:].sum() for i in range(vals.shape[0])]
+            max_n = (np.array(vals) > -imp_boundary).sum()
+        elif imp_boundary > 0:
+            max_n = (imps['value'] > imp_boundary).sum()
+        else:
+            max_n = imps.shape[0]
+
+        opts = np.unique(np.linspace(min_n, max_n, int(np.sqrt(max_n - min_n))).astype('int')).tolist()
+        collection = {}
+        saved_data = self.data_.copy()
+
+        while (max(opts) - min(opts)) > 8:
+            ns = []
+            for opt in opts:
+                self.data_ = saved_data.copy()
+                keep = [self.yname] + imps.head(opt).index.values.tolist()
+                self.data_ = self.data_[keep]
+                self.kfold(k=k, modeler='selection', **kwargs)
+                preds = self.kfold_predictions_.copy()
+                loss_mean = ((preds['predicted'] / preds['actual']) - 1).replace(to_replace, np.nan).abs().median()
+                loss_corr = preds.corr().iloc[0, -1]
+                loss_corr = loss_corr if loss_corr > 0.0 else 1.7976931348623157e-308
+                collection[opt] = loss_mean / loss_corr
+                ns.append(loss_mean)
+            ind = (np.round(ns, sensitivity) == np.round(ns, sensitivity).min()).argmax()
+            min_n = min_n + 1 if ind == 0 else opts[ind - 1] + 1
+            max_n = max_n - 1 if ind == (len(opts) - 1) else opts[ind + 1] - 1
+            opts = np.unique(np.linspace(min_n, max_n, int(np.sqrt(max_n - min_n))).astype('int')).tolist()
+            #print sorted(collection.keys())
+
+        opts = [x for x in range(min_n, max_n + 1) if x not in collection.keys()]
+
+        for opt in opts:
+            self.data_ = saved_data.copy()
+            keep = [self.yname] + imps.head(opt).index.values.tolist()
             self.data_ = self.data_[keep]
-            self.kfold(k=k, **kwargs)
+            self.kfold(k=k, modeler='selection', **kwargs)
             preds = self.kfold_predictions_.copy()
             loss_mean = ((preds['predicted'] / preds['actual']) - 1).replace(to_replace, np.nan).abs().median()
-            ns.append((n, loss_mean))
-            #print n, round(loss_mean, 4)
-            n = int(n/2)
+            collection[opt] = loss_mean
 
-        self.saved_state_['data'] = saved_data.copy()
-        self._load_state()
+        self.data_ = saved_data.copy()
 
-        n_ind = pd.Series([x[1] for x in ns]).pct_change().argmin() - 1
-        max_n = pd.Series([x[0] for x in ns])[n_ind] + 1
-        min_n = minimum if max_n < boundary else max_n/2.0
+        keys, values = zip(*sorted(collection.items()))
+        keep_n = keys[np.argmin(np.round(values, sensitivity))]
 
-        ns = []
-        for n in range(min_n, max_n)[::-1]:
-            keep = [self.yname] + imps.head(n).index.values.tolist()
-            self.data_ = self.data_[keep]
-            self.kfold(k=k, **kwargs)
-            preds = self.kfold_predictions_.copy()
-            loss_mean = ((preds['predicted'] / preds['actual']) - 1).replace(to_replace, np.nan).abs().median()
-            ns.append((n, loss_mean))
-            #print n, round(loss_mean, 4)
-
-        self.saved_state_['data'] = saved_data.copy()
-        self._load_state()
-
-        keep_n = pd.Series([x[1] for x in ns]).round(sensitivity).argmin()
-        keep_n = pd.Series([x[0] for x in ns])[keep_n]
-
-        imps.ix[keep_n:, 'keep'] = False
+        imps.iloc[keep_n:, :]['keep'] = False
         self.feature_importances_ = imps.copy()
 
     def filter_data(self, new_data=None):
@@ -922,96 +966,6 @@ class Ensemble(object):
             self.data_ = self.data_[keep].copy()
         else:
             return new_data[keep].copy()
-
-    def simulate(self, predictors=None, n_inc=100, n_compare=100):
-        """Simulate response of outcome variable to changes in each predictor, holding everything else constant.
-
-        Args:
-            predictors (list, optional): list of predictors for which to calculate coefficients, all predictors in
-                `data_` used if none fed to method
-            n_inc (int): number of evenly-spaced increments in the outcome variable to use for the simulation
-            n_compare (int): number of comparisons to make for each increment
-
-        Returns:
-            simulations_ (pandas.DataFrame):
-            coefficients_ (pandas.DataFrame):
-
-
-        """
-
-        predictors = self.data_.drop([self.yname], axis=1).columns.values.tolist() if predictors is None else predictors
-        sim_data = self.training_data_scaled_.copy()
-
-        output_dfs = []
-        boots = []
-        for p in predictors:
-            sims = np.linspace(sim_data[p].min(), sim_data[p].max(), n_inc)
-            others = [pred for pred in predictors if pred != p]
-            weights = [make_weights(sim_data[p], (sims < s).mean()) for s in sims]
-            other_vals = [[np.random.choice(sim_data[o], size=n_compare, p=w) for o in others] for w in weights]
-            other_vals = np.concatenate([np.column_stack(vals) for vals in other_vals], axis=0)
-
-            idx = pd.MultiIndex.from_tuples(others, names=self.data_.columns.names)
-            sim_vals = pd.DataFrame(other_vals, columns=idx)
-            sim_vals[p] = sims.tolist() * n_compare
-            sim_vals = sim_vals[predictors]
-            sim_vals = sim_vals.sort([p])
-
-            predictor = sim_vals[p].copy()
-            preds = pd.Series(index=sim_vals.index)
-            preds.loc[:] = self.modeler.predict(sim_vals)
-
-            #plt.plot(predictor, preds, '.')
-            #plt.show()
-
-            boot_output = pd.Series()
-            boot = []
-            for i in range(n_compare):
-                resample = np.random.choice(predictor.shape[0], predictor.shape[0])
-                x = predictor.to_frame('p').iloc[resample, :]
-                y = preds.iloc[resample]
-                slope = LinearRegression().fit(X=x, y=y).coef_[:][0]
-                boot.append(slope)
-            boot_output['smean'] = pd.Series(boot).mean()
-            boot_output['sstd'] = pd.Series(boot).std()
-            check = preds.groupby(predictor).mean()
-            boot_output['soffset'] = LinearRegression().fit(X=check.to_frame('p'), y=check.index.values).coef_[:][0]
-
-            if all([type(x) == pd.Series for x in self.scaler.values()]):
-                preds = (preds * self.scaler['std'][self.yname]) + self.scaler['mean'][self.yname]
-                predictor = (predictor * self.scaler['std'][p]) + self.scaler['mean'][p]
-            output = pd.DataFrame(index=sim_vals.index)
-            output['outcome'] = preds
-            output['value'] = predictor
-            index_names = sim_vals.columns.names + ['increment', 'simulation']
-            increment = np.tile(range(n_inc), n_compare)
-            simulation = np.repeat(range(n_compare), n_inc)
-            output_index = [p + (increment[j], ) + (simulation[j], ) for j in range(len(increment))]
-            output_index = pd.MultiIndex.from_tuples(output_index, names=index_names)
-            output.index = output_index
-
-            boot = []
-            for i in range(n_compare):
-                resample = np.random.choice(predictor.shape[0], predictor.shape[0])
-                x = predictor.to_frame('p').iloc[resample, :]
-                y = preds.iloc[resample]
-                slope = LinearRegression().fit(X=x, y=y).coef_[:][0]
-                boot.append(slope)
-            boot_output['rmean'] = pd.Series(boot).mean()
-            boot_output['rstd'] = pd.Series(boot).std()
-            check = preds.groupby(predictor).mean()
-            boot_output['roffset'] = LinearRegression().fit(X=check.to_frame('p'), y=check.index.values).coef_[:][0]
-
-            output_dfs.append(output.copy())
-            boots.append(boot_output.copy())
-
-        output_dfs = pd.concat(output_dfs, axis=0)
-        boots = pd.concat(boots, axis=1, keys=predictors).T
-        boots.index = pd.MultiIndex.from_tuples(boots.index.values, names=self.data_.columns.names)
-        boots['importance'] = self.feature_importances_[self.feature_importances_['keep']]['value']
-
-        self.simulations_ = output_dfs
-        self.coefficients_ = boots
 
     def empirical_error(self, predictions=None, cv_preds=None, cv_actuals=None, n=1000, q=None):
         """Calculate prediction errors based on cross-validation errors.
@@ -1034,6 +988,12 @@ class Ensemble(object):
         return_output = predictions is not None
         cv_preds = self.kfold_predictions_['predicted'].copy() if cv_preds is None else cv_preds
         cv_actuals = self.kfold_predictions_['actual'].copy() if cv_actuals is None else cv_actuals
+
+        if (cv_preds == 0.0).all():
+            cv_preds.loc[:] = np.random.normal(0.0, 0.0000000001, cv_preds.shape[0])
+        if (cv_actuals == 0.0).all():
+            cv_actuals.loc[:] = np.random.normal(0.0, 0.0000000001, cv_actuals.shape[0])
+
         predictions = self.predictions_['predicted'].copy() if predictions is None else predictions
 
         # calculate ratio of predicted and actual
@@ -1058,6 +1018,141 @@ class Ensemble(object):
                 self.error_estimates_ = output.copy()
         if return_output:
             return (output, errors) if q is not None else errors
+
+    def simulate(self, predictors=None, n_inc=25, n_compare=100, n_boot=1):
+        """Simulate response of outcome variable to changes in each predictor, holding everything else constant.
+
+        Args:
+            predictors (list, optional): list of predictors for which to calculate coefficients, all predictors in
+                `data_` used if none fed to method
+            n_inc (int): number of evenly-spaced increments in the outcome variable to use for the simulation
+            n_compare (int): number of comparisons to make for each increment
+            b_boot (int): number of bootstrap samples to use to estimate slope
+
+        Returns:
+            simulations_ (pandas.DataFrame):
+            coefficients_ (pandas.DataFrame):
+
+
+        """
+
+        predictors = self.data_.drop([self.yname], axis=1).columns.values.tolist() if predictors is None else predictors
+        sim_data = self.training_data_scaled_.copy()
+
+        output_dfs = []
+        boots = []
+        n = n_compare ** 2
+        for p in predictors:
+            #print len(predictors) - predictors.index(p)
+            sims = np.linspace(sim_data[p].min(), sim_data[p].max(), n_inc)
+            others = [pred for pred in predictors if pred != p]
+            if len(others) > 0:
+                weights = [make_weights(sim_data[p], (sims < s).mean()) for s in sims]
+                other_vals = [[np.random.choice(sim_data[o], size=n_compare, p=w) for o in others] for w in weights]
+                other_vals = np.concatenate([np.column_stack(vals) for vals in other_vals], axis=0)
+                idx = pd.MultiIndex.from_tuples(others, names=self.data_.columns.names)
+                sim_vals = pd.DataFrame(other_vals, columns=idx)
+                sim_vals[p] = sims.tolist() * n_compare
+            else:
+                sim_vals = pd.DataFrame()
+                sim_vals[p] = sims.tolist() * n_compare
+                sim_vals.columns = pd.MultiIndex.from_tuples([p], names=self.data_.columns.names)
+
+            sim_vals = sim_vals[predictors]
+            sim_vals = sim_vals.sort([p])
+
+            predictor = sim_vals[p].copy()
+            preds = pd.Series(index=sim_vals.index)
+            preds.loc[:] = self.validation_modeler.predict(sim_vals)
+            cv_preds = self.kfold_predictions_.copy()
+            preds = self.empirical_error(preds, cv_preds['predicted'], cv_preds['actual'], n=n_compare).stack()
+            predictor = predictor.iloc[range(predictor.shape[0]) * n_compare]
+
+            boot_output = pd.Series()
+            pearson = 0
+            kendall = 0
+            for i in range(n_boot):
+                resample = np.random.choice(predictor.shape[0], n)
+                corrdata = pd.DataFrame()
+                corrdata['x'] = predictor.values[resample]
+                corrdata['y'] = preds.values[resample]
+                pearson += corrdata.corr('pearson').iloc[0, -1]
+                kendall += corrdata.corr('kendall').iloc[0, -1]
+            boot_output['pearson'] = pearson / n_boot
+            boot_output['kendal'] = kendall / n_boot
+
+            if all([type(x) == pd.Series for x in self.scaler.values()]):
+                preds = (preds * self.scaler['std'][self.yname]) + self.scaler['mean'][self.yname]
+                predictor = (predictor * self.scaler['std'][p]) + self.scaler['mean'][p]
+            output = pd.DataFrame()
+            output['outcome'] = preds.values
+            output['value'] = predictor.values
+            index_names = sim_vals.columns.names + ['increment', 'simulation']
+            increment = np.tile(range(n_inc), n_compare**2)
+            simulation = np.repeat(range(n_compare**2), n_inc)
+            output_index = [p + (increment[j], ) + (simulation[j], ) for j in range(len(increment))]
+            output_index = pd.MultiIndex.from_tuples(output_index, names=index_names)
+            output.index = output_index
+
+            output_dfs.append(output.copy())
+            boots.append(boot_output.copy())
+
+        output_dfs = pd.concat(output_dfs, axis=0)
+        boots = pd.concat(boots, axis=1, keys=predictors).T
+        boots.index = pd.MultiIndex.from_tuples(boots.index.values, names=self.data_.columns.names)
+        boots['importance'] = self.feature_importances_[self.feature_importances_['keep']]['value']
+
+        self.simulations_ = output_dfs
+        self.coefficients_ = boots
+
+    def run(
+            self, ks=(2, 10), sensitivity=3, imp_boundary=None, predictors=None, n_inc=25, n_compare=100, n_boot=250,
+            verbose=False):
+        """
+
+        Args:
+            ks (tuple): length 2, first element fet to `select_features`, second to `kfold`
+            minimum (int): passed to `select_features`
+            scaler (float): passed to `select_features`
+            **kwargs: passed to `simulate`
+
+        Returns:
+            None
+
+
+        """
+
+        if verbose:
+            print 'running:',
+
+        self.fit()
+
+        if verbose:
+            print 'selecting...',
+            t0 = time.time()
+
+        self.select_features(k=ks[0], sensitivity=sensitivity, imp_boundary=imp_boundary)
+        self.filter_data()
+
+        if verbose:
+            print self.feature_importances_['keep'].sum(),
+            print round(time.time() - t0, 1),
+            print 'validating...',
+            t0 = time.time()
+
+        self.kfold(k=ks[1])
+        self.fit()
+
+        if verbose:
+            print round(time.time() - t0, 1),
+            print 'simulating...',
+            t0 = time.time()
+
+        self.simulate(predictors=predictors, n_inc=n_inc, n_compare=n_compare, n_boot=n_boot)
+
+        if verbose:
+            print round(time.time() - t0, 1),
+            print 'finishing...'
 
 
 class ProductSpace(object):
@@ -1200,291 +1295,253 @@ class ProductSpace(object):
         return n, proximity, density
 
 
-def corr_data(data, i, value_var, time_var, index_vars, min_time=None, t=None, weight=False, fill=True, return_df=True):
-    t0 = time.time()
-    print 'shaping data sets...'
-    
-    min_t = data[time_var].max() if min_time is None else min_time
-    df = data.set_index(index_vars+[time_var])[value_var].unstack(index_vars)
-    output_df = df.T.stack().to_frame(value_var).reset_index()
-    output_df = output_df.set_index(index_vars+[time_var])
-    output_df = output_df[value_var].unstack(index_vars)
-    
-    df0 = df.T.stack().to_frame(value_var).reset_index()
-    df0 = df0[df0[time_var]>=min_t]
-    df0 = df0.set_index(index_vars+[time_var])
-    df0 = df0[value_var].unstack(index_vars)
-
-    dfi = df.shift(i).T.stack().to_frame(value_var).reset_index()
-    dfi = dfi[dfi[time_var]>=min_t]
-    dfi = dfi.set_index(index_vars+[time_var])
-    dfi = dfi[value_var].unstack(index_vars)
-    
-    if fill:
-        df0 = df0.fillna(0)
-        dfi = dfi.fillna(0)
-        
-    col_ind = len(df0.columns)
-    df = pd.concat([df0, dfi], axis=1)
-
-    print 'calculating correlations...'
-    corrs = df.corr('pearson', min_periods=i)
-    if weight:
-        jaccard = pairwise_distances(df.T.notnull().values, metric='jaccard',
-                               n_jobs=-1)
-        jaccard = pd.DataFrame(jaccard, columns=corrs.columns, index=corrs.index)
-    
-    print 'filtering correlations...'
-    corrs = corrs.iloc[:col_ind, (col_ind+1):]
-    corrs = corrs.fillna(0)
-    if weight:
-        jaccard = jaccard.iloc[:col_ind, (col_ind+1):]
-        jaccard = 1 - jaccard
-        corrs *= jaccard
-    column_names = [str(x)+'_compare' for x in corrs.columns.names]
-    corrs.columns.names = column_names
-    
-    if t is not None:        
-        corrs = corrs.stack(column_names)
-        corrs = corrs[corrs >= t].sort_index()
-        corrs = corrs.unstack(column_names)
-
-    print 'total time:', time.time() - t0
-    if return_df:
-        return output_df, corrs
-    else:
-        return corrs
-
-from sklearn.decomposition import KernelPCA
-from sklearn.cluster import AffinityPropagation
-import matplotlib.pyplot as plt
+class DimensionalityReduction(object):
+    """Class for doing demensionality reduction through principal components analysis, with options for kernel
+    transformation and affinity propagation.
 
 
-def get_continuity_start(arr, rounder=None):
-    d = arr.values
-    d = np.diff(d)
-    if rounder is not None:
-        d = np.round(d, rounder)
-    out = []
-    j = 0
-    for i in range(1, len(d)):
-        if d[i-1] != d[i]:
-            j = i
-        out.append(j)
-    
-    s = pd.Series(out).value_counts()
-    if s.iloc[0] == 1:
-        print 'no good choice'
-    else:
-        return arr.index[s.index[0]]
+    """
 
-def percent_majority(x):
-    signed = np.sign(x)
-    top = np.sign(x).astype(str).describe().T['top'].astype(float)
-    percent = (signed != top).sum()
-    return percent
+    def __init__(self, data):
+        """Initialization function.
 
-def affinity_propagation(df, weights=None, rounder=3, output='object', 
-                         verbose=False):
-    if type(df) == pd.DataFrame:
-        df1 = df.values
-    else:
-        df1 = df
-    dists = pairwise_distances(df1).flatten()**2
-    dists = dists[dists > 0.0]
-    inputs = np.linspace(-np.median(dists)/2, -dists.min(), 101)[:-1]
-    ds = np.arange(0.5, 1.0-0.01, .01)
+        Args:
+            data (pandas.DataFrame): data frame of matrix to be decomposed (all non-number columns must be in index)
 
-    out = []
-    if verbose:
-        print 'exploring damping options...'
-    for d in ds:
-        if verbose:
-            print d, 
-        km = AffinityPropagation(preference=inputs[0], damping=d, convergence_iter=30, max_iter=400)
-        x = km.fit(df1) 
+        Attributes:
+            data_ (pandas.DataFrame): raw data
+            corrmatrix_ (pandas.DataFrame): correlation matrix of data_
+            variance_explained_ (pandas.DataFrame): variance explained for filtered components
+            all_variance_explained_ (pandas.DataFrame): variance explained for all components
+            loadings_ (pandas.DataFrame): filtered component loadings
+            all_loadings_ (pandas.DataFrame): all component loadings
+            projection_ (pandas.DataFrame): principal components transformation of data_
+            pca_object_ (sklearn.decomposition.KernelPCA): KernelPCA class
+            ap_object_ (sklearn.cluster.AffinityPropagation): Affinity Propagation class
+            clusters_ = (pandas.Series): cluster assignments from affinity propagation
+
+
+        """
+        self.data_ = data.copy()
+        self.corrmatrix_ = pd.DataFrame()
+        self.variance_explained_ = pd.DataFrame()
+        self.all_variance_explained_ = pd.DataFrame()
+        self.loadings_ = pd.DataFrame()
+        self.all_loadings_ = pd.DataFrame()
+        self.projection_ = pd.DataFrame()
+        self.pca_object_ = None
+        self.ap_object_ = None
+        self.clusters_ = pd.Series()
+
+    def prep(self, log=False, standardize=True, method='pearson', nas=None):
+        """Transform data_ into correlation matrix.
+
+        Args:
+            log (bool): whether to take natural logarithm of data before standardizing (mins are subtracted)
+            standardize (bool): whether to z-score data before correlating
+            method (str): passed to pandas.DataFrame.corr
+            nas (str or int or float): how to handle null values
+
+        Returns:
+            corrmatrix_ (pandas.DataFrame): correlation matrix
+
+
+        """
+        df = self.data_.copy()
+        if log:
+            df = np.log(df - df.min() + 1)
+
+        if type(standardize) is not bool:
+            zscore = lambda x: (x - x.mean()) / x.std()
+            df = df.groupby(level=standardize).transform(zscore)
+        elif standardize:
+            df = (df - df.mean()) / df.std()
+
+        if method == 'jaccard':
+            if not np.all(df.dtypes == bool):
+                df = df.T.notnull()
+            jaccard = pairwise_distances(df.values, metric='jaccard')
+            df = pd.DataFrame(jaccard, columns=df.columns, index=df.columns)
+        elif method is not None:
+            df = df.corr(method)
+
+        if nas == 'drop_1':
+            df = df.dropna(axis=1)
+        elif nas == 'drop_0':
+            df = df.dropna(axis=0)
+        elif nas == 'drop':
+            df = df.dropna()
+        elif nas == 'all':
+            ind = df.isnull().all().values
+            df = df.loc[~ind, :].loc[:, ~ind]
+        elif nas is not None:
+            df = df.fillna(nas)
+
+        self.corrmatrix_ = df.copy()
+
+    def decompose(self, kernel='linear', method='pearson', threshold=2, **kwargs):
+        """
+
+        Args:
+            kernel (str): passed to KernelPCA
+            method (str): passed to pandas.DataFrame.corr
+            threshold (int): cutoff for filtering components
+            kwargs: passed to KernelPCA
+
+        Returns:
+            variance_explained_ (pandas.DataFrame): variance explained for filtered components
+            all_variance_explained_ (pandas.DataFrame): variance explained for all components
+            loadings_ (pandas.DataFrame): filtered component loadings
+            all_loadings_ (pandas.DataFrame): all component loadings
+            projection_ (pandas.DataFrame): principal components transformation of data_
+            pca_object_ (sklearn.decomposition.KernelPCA): KernelPCA class
+
+
+        """
+        sp = KernelPCA(n_components=min(*self.corrmatrix_.shape), kernel=kernel, **kwargs)
+
+        proj = sp.fit_transform(self.corrmatrix_)
+        proj = pd.DataFrame(proj, index=self.corrmatrix_.index)
+        proj.columns = [x+1 for x in proj.columns]
+
+        var_expl = sp.lambdas_
+        var_expl[var_expl < 0.0] = 0.0
+        var_expl = var_expl / var_expl.sum()
+
+        loadings = pd.concat([self.corrmatrix_, proj], axis=1).corr(method)
+        loadings = loadings.loc[:, proj.columns].loc[self.corrmatrix_.columns, :]
+        self.all_loadings_ = loadings.copy()
+        keep = (var_expl > (float(threshold) / self.corrmatrix_.shape[1])).sum()
+        loadings = loadings.iloc[:, :keep]
+
+        variance_explained = pd.DataFrame(index=loadings.columns)
+        self.all_variance_explained_ = variance_explained.copy()
+        variance_explained['total'] = var_expl[:keep]
+        variance_explained['cumulative'] = var_expl.cumsum()[:keep]
+        variance_explained['max_abs_corr'] = loadings.abs().max()
+
+        self.variance_explained_ = variance_explained.copy()
+        self.loadings_ = loadings.copy()
+        self.projection_ = proj.copy()
+        self.pca_object_ = sp
+
+    def _evaluate_propagation(self, loads, p, d, weights=True, **kwargs):
+        """Helper function to aid with grid search of AffinityPropagation parameters.
+
+        Args:
+            loads (pandas.DataFrame): loadings from KernelPCA
+            p (int): passed to AffinityPropagation
+            d (int): passed to AffinityPropagation
+            weights (bool): whether to weight summary measures by the number of records in a grouping
+            **kwargs: passed to AffinityPropagation
+
+        Returns:
+            rang (float): (possibly weighted) average range of loadings
+            percents (float): (possibly weighted) average of percentage of loadings that have the same sign as
+            the majority of records in the grouping
+
+
+        """
+
+        cols = loads.columns
+        km = AffinityPropagation(preference=p, damping=d, **kwargs)
+        x = km.fit(loads.values)
         labels = pd.Series(km.labels_).value_counts(normalize=True).sort_index()
-        maxs = df.groupby(km.labels_).max() 
-        mins = df.groupby(km.labels_).min()
+        maxs = self.loadings_[cols].groupby(km.labels_).max()
+        mins = self.loadings_[cols].groupby(km.labels_).min()
         rang = maxs - mins
         rang = (rang.T * labels).T.sum() / labels.sum()
-        if weights is not None:
-            rang = (rang * np.array(weights)).sum() / np.array(weights).sum()
+
+        percent_majority = lambda x: np.sign(x).apply(lambda y: y.value_counts(normalize=True).max())
+        percents = self.loadings_[cols].groupby(km.labels_).apply(percent_majority)
+
+        if weights:
+            use_weights = self.variance_explained_['total'][cols].values
+            rang = (rang * np.array(use_weights)).sum() / np.array(use_weights).sum()
+            percents = ((percents * np.array(use_weights)).sum(axis=1) / np.array(use_weights).sum()).mean()
         else:
             rang = rang.mean()
-        out.append(rang)
-    
-    out = pd.Series(out, index=ds)
-    damp = get_continuity_start(out, rounder)
-    damps = out.copy()
-    
-    out = []
-    counts = []
-    n = []
-    if verbose:
-        print ''
-        print 'exploring preference options...'
-    for i in inputs:
-        if verbose:
-            print np.round(i, 2),
-        km = AffinityPropagation(preference=i, damping=damp, 
-                                 convergence_iter=30, max_iter=400)
-        x = km.fit(df1) 
-        labels = pd.Series(km.labels_).value_counts(normalize=True).sort_index()
-        maxs = df.groupby(km.labels_).max() 
-        mins = df.groupby(km.labels_).min()
-        rang = maxs - mins
-        rang = (rang.T * labels).T.sum() / labels.sum()
-        if weights is not None:
-            rang = (rang * np.array(weights)).sum() / np.array(weights).sum()
+            percents = percents.mean().mean()
+
+        return rang, percents
+
+    @staticmethod
+    def check_continuity(x, sensitivity=2):
+        """Returns midpoint of largest grouping of lowest values (rounded to specified decimal points).
+
+        Args:
+            x (pandas.Series): values are diagnostic outputs, index is parameter values from grid search
+            sensitivity (int): how many decimal places to consider when looking for best parameters
+
+        Returns:
+            x_keep (float): best value of x.index
+
+
+        """
+
+        x = pd.Series(x, index=x.index).round(sensitivity)
+        x_min = x.min()
+        j = 0
+        outs = []
+        for i in range(1, len(x)):
+            if x.iloc[i] != x.iloc[i-1]:
+                j += 1
+            outs.append(j)
+        x_groups = pd.Series([0] + outs, index=x.index)
+        group_ind = x_groups[x == x_min].value_counts().argmax()
+        in_group = (x_groups == group_ind).values
+        x_keep = np.sum(x.index.values[in_group][[0, -1]]) / 2
+        return x_keep
+
+    def affinity_propagation(self, n_inputs=100, weights=True, sensitivity=2, subset=None, **kwargs):
+        """Use Affinity Propagation to cluster records based on PCA loadings.
+
+        Args:
+            n_inputs: number of values to test for `preference` parameter in AffinityPropagation
+            weights (bool): whether to weight summary measures by the number of records in a grouping
+            sensitivity (int): how many decimal places to consider when looking for best parameters
+            **kwargs: passed to AffinityPropagation
+
+        Returns:
+            ap_object_ (sklearn.cluster.AffinityPropagation): Affinity Propagation class
+            clusters_ = (pandas.Series): cluster assignments from affinity propagation
+
+        Notes:
+            good defaults: kwargs = dict(convergence_iter=30, max_iter=400)
+
+
+        """
+
+        if type(subset) == int:
+            loads = self.loadings_.loc[:, :subset].fillna(0.0)
+        elif hasattr(subset, '__iter__'):
+            loads = self.loadings_.loc[:, subset].fillna(0.0)
         else:
-            rang = rang.mean()
+            loads = self.loadings_.fillna(0.0)
 
-        new_labels = labels.copy()
-        new_labels = 1.0 - new_labels
-        new_labels[pd.Series(km.labels_).value_counts().sort_index()==1] = 0.0
-        percents = df.groupby(km.labels_).apply(percent_majority)
-        #mask = percents.sum(axis=1)!=1.0
-        #percents = (percents[mask].T * new_labels[mask]).T.sum() / new_labels[mask].sum()
-        percents = percents.sum()
-        if weights is not None:
-            percents = (percents * np.array(weights)).sum() / np.array(weights).sum()
-        else:
-            percents = percents.mean()
+        dists = pairwise_distances(loads.values).flatten() ** 2
+        dists = dists[dists > 0.0]
+        inputs = np.linspace(-np.median(dists) / 2, -dists.min(), n_inputs + 1)[:-1]
+        ds = np.arange(0.5, 1.0, .01)
 
-        #percents = percents.values.sum()
+        out = [self._evaluate_propagation(loads, p=inputs[0], d=d, weights=weights, **kwargs) for d in ds]
+        mean_range, mean_percent = zip(*out)
+        mean_range = pd.Series(mean_range, index=ds)
+        mean_percent = pd.Series(mean_percent, index=ds)
+        out_range = self.check_continuity(mean_range, sensitivity)
+        out_percent = self.check_continuity(mean_percent, sensitivity)
+        damp = np.mean([out_range, out_percent])
 
-        out.append(rang)
-        counts.append(percents)
-        n.append(labels.shape[0])
+        out = [self._evaluate_propagation(loads, p=i, d=damp, weights=weights, **kwargs) for i in inputs]
+        mean_range, mean_percent = zip(*out)
+        mean_range = pd.Series(mean_range, index=inputs)
+        mean_percent = pd.Series(mean_percent, index=inputs)
+        out_range = self.check_continuity(mean_range, sensitivity)
+        out_percent = self.check_continuity(mean_percent, sensitivity)
+        pref = np.mean([out_range, out_percent])
 
-    out = pd.DataFrame({'mean_range': out, 'total_count': counts, 'n_groups': n}, index=inputs)
-    
-    min_ind = get_continuity_start(out['n_groups'].pct_change(),rounder)
-    max_ind = (out.loc[min_ind:, 'n_groups'].pct_change().dropna().abs().round(rounder) != 0.0).argmax()
-    pref = out.loc[min_ind:max_ind, :].iloc[:-1, :]
-    if len(pref)==0:
-        print ''
-        print 'mean_corr and n_mult criteria exclude all possibilities'
-        return out
-    else: 
-        pref = pref[pref['total_count'] == pref['total_count'].min()].index[0]
-    
-    if output == 'object':
-        km = AffinityPropagation(preference=pref, damping=damp, convergence_iter=30, max_iter=400)
-        x = km.fit(df1) 
-        return km
-    else:
-        return damps, out, damp, pref
+        km = AffinityPropagation(preference=pref, damping=damp, **kwargs)
+        x = km.fit(loads.values)
 
-
-def principal_components(
-        data, idx, val, kernel='linear', cluster=True, components=None, sensitivity=3, verbose=False, output_dict=None):
-    try:
-        df = data[val].unstack(idx).fillna(0).T
-    except:
-        df = data.set_index(idx)[val].unstack().fillna(0).T
-    df = np.log(df+1)
-    df = (df - df.mean()) / df.std()
-    df = df.T.corr()
-    sp = KernelPCA(n_components=min(*df.shape), kernel=kernel)
-    proj = sp.fit_transform(df)
-    var_expl = sp.lambdas_
-    var_expl[var_expl<0.0] = 0.0
-    var_expl = var_expl/var_expl.sum()
-    proj = pd.DataFrame(proj, index=df.index)
-    proj.columns = [x+1 for x in proj.columns]
-    loadings= pd.concat([df, proj], axis=1).corr()
-    loadings = loadings.loc[:, proj.columns].loc[df.columns,:]
-    keep = (var_expl>(2.0/df.shape[1])).sum()
-    loadings = loadings.iloc[:,:keep]    
-    variance_explained = pd.DataFrame(index=loadings.columns)
-    variance_explained['total'] = var_expl[:keep]
-    variance_explained['cumulative'] = var_expl.cumsum()[:keep]
-    variance_explained['max_abs_corr'] = loadings.abs().max()
-
-    if components is None:
-        load_cols = variance_explained.index
-    else:
-        load_cols = components
-
-    output = loadings.copy()
-    
-    if cluster:
-        ap = affinity_propagation(
-            df=loadings[load_cols], weights=variance_explained['total'][load_cols].values, rounder=sensitivity,
-            verbose=verbose)
-        output['cluster'] = ap.labels_
-
-        if output_dict is not None:
-            level_values = output.index.get_level_values(output_dict).values
-            cat_dict = pd.Series(level_values).groupby(ap.labels_).unique()
-            cat_dict = cat_dict.to_dict()
-            cat_dict = {k:v.tolist() for k,v in cat_dict.items()}
-        
-    class Final(object):
-        correlation = df.copy()
-        diagnostic = variance_explained
-        pca_object = sp
-        ap_object = ap
-        loading = output
-        cluster_dictionary = cat_dict
-    
-    final_output = Final()
-    
-    return final_output
-
-
-def plot_components(loadings, labels=None, components=None):
-    loads = loadings.copy()
-    if labels is not None:
-        loads['cluster'] = labels
-
-    x_lab = components[0] if components is not None else 1
-    y_lab = components[1] if components is not None else 2
-
-    if labels is None:
-        plt.plot(loadings[x_lab], loadings[y_lab], '.')
-    else:
-        plt.figure()
-
-    x = plt.xlim(-1.0, 1.0)
-    x = plt.ylim(-1.0, 1.0)
-    x = plt.yticks(np.linspace(-1.0, 1.0, 9), fontsize=7)
-    x = plt.xticks(np.linspace(-1.0, 1.0, 9), fontsize=7)
-    x = plt.axhline(y=0, xmin=-1.0, xmax=1.0)
-    x = plt.axvline(x=0, ymin=-1.0, ymax=1.0)
-    
-    if labels is not None:    
-        for i in loads.index:
-            x = plt.text(loads.loc[i, x_lab], loads.loc[i, y_lab], 
-                str(int(loads.loc[i,'cluster'])), fontdict={'size': 6})
-    plt.show()
-
-
-def plot_correlations(corr, loadings, component=1, cmap='RdBu',
-                          tick_level=None):
-    df_corr = corr.copy()
-    if type(component)==int:
-        loads = loadings[[component]].mean(axis=1).order().copy()
-        col_order = loads.index
-    elif component=='naive':
-        col_order = df_corr.sum().order().index
-    df_plot = df_corr.loc[col_order, col_order].copy()
-
-    x = plt.pcolor(df_plot, cmap=cmap, vmin=-1.0, vmax=1.0)
-    x = plt.xlim(0, df_plot.shape[0])
-    x = plt.ylim(0, df_plot.shape[1])
-    if tick_level is not None:
-        x = plt.yticks(np.arange(0.5, df_plot.shape[0], 1), 
-                       df_plot.index.get_level_values('emcategory'), 
-                       fontsize=7)
-        x = plt.xticks(np.arange(0.5, df_plot.shape[1], 1), 
-                       df_plot.columns.get_level_values('emcategory'), 
-                       rotation=270, fontsize=7)
-    else:
-        x = plt.yticks(np.arange(0.5, df_plot.shape[0], 1), fontsize=7)
-        x = plt.xticks(np.arange(0.5, df_plot.shape[1], 1), rotation=270, 
-            fontsize=7)
-
-    plt.show()
+        self.ap_object_ = km
+        self.clusters_ = pd.Series(km.labels_, index=self.loadings_.index)
