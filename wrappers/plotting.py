@@ -28,12 +28,12 @@ HTML_HEAD = '''
         
 <link rel="stylesheet" href="http://maxcdn.bootstrapcdn.com/bootstrap/3.2.0/css/bootstrap.min.css">
 <link rel="stylesheet" href="http://maxcdn.bootstrapcdn.com/bootstrap/3.2.0/css/bootstrap-theme.min.css">
-<link rel="stylesheet" href="http://cdn.pydata.org/bokeh-0.6.0.css" type="text/css" />
+<link rel="stylesheet" href="http://cdn.pydata.org/bokeh-0.6.1.css" type="text/css" />
 <link rel="stylesheet" href="http://cdn.datatables.net/1.10.2/css/jquery.dataTables.min.css">
 
 <script src="http://ajax.googleapis.com/ajax/libs/jquery/2.1.1/jquery.min.js"></script>
 <script src="http://maxcdn.bootstrapcdn.com/bootstrap/3.2.0/js/bootstrap.min.js"></script>
-<script type="text/javascript" src="http://cdn.pydata.org/bokeh-0.6.0.js"></script>
+<script type="text/javascript" src="http://cdn.pydata.org/bokeh-0.6.1.js"></script>
 <script type="text/javascript" src="http://cdn.datatables.net/1.10.2/js/jquery.dataTables.min.js"></script>
 '''
 
@@ -172,7 +172,9 @@ hr {
   padding: 0px;
   margin: 0px;
 }
-
+.navbar-brand {
+  color: white;
+}
 a.nav-expander {
   background: none repeat scroll 0 0 #000000;
   color: #FFFFFF;
@@ -1114,7 +1116,7 @@ def prep_body(plot_keys, id_prefix=None, js_folder='', footer=None, table=True, 
         navigation = make_slider(
             plot_keys, id_prefix=id_prefix, js_folder=js_folder, page_title=page_title)
 
-        content = '<div class="plotholder col-md-6">\n</div>'
+        content = '<div class="plotholder col-md-{n}">\n</div>'.format(n=6 if table else 12)
         if table:
             content += '\n'
             content += '<div class="tableholder col-md-6"></div>'

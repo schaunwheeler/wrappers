@@ -883,7 +883,7 @@ class Ensemble(object):
         preds = pd.concat([x.predictions_ for x in self.kfold_results_])
         self.kfold_predictions_ = preds.copy()
 
-    def select_features(self, k=2, sensitivity=3, imp_boundary=None, **kwargs):
+    def select_features(self, k=2, sensitivity=2, imp_boundary=None, **kwargs):
         """Select features based on k-fold cross validation, using median absolute percent error weighted by pearson
          correlatino coefficient as a loss function
 
@@ -914,7 +914,11 @@ class Ensemble(object):
         else:
             max_n = imps.shape[0]
 
-        opts = np.unique(np.linspace(min_n, max_n, int(np.sqrt(max_n - min_n))).astype('int')).tolist()
+        if max_n > min_n:
+            opts = np.unique(np.linspace(min_n, max_n, int(np.sqrt(max_n - min_n))).astype('int')).tolist()
+        else:
+            max_n = int(np.log(imps.shape[0]))
+            opts = np.unique(np.linspace(min_n, max_n, max_n).astype('int')).tolist()
         collection = {}
         saved_data = self.data_.copy()
 
@@ -939,21 +943,21 @@ class Ensemble(object):
 
         opts = [x for x in range(min_n, max_n + 1) if x not in collection.keys()]
 
-        for opt in opts:
-            self.data_ = saved_data.copy()
-            keep = [self.yname] + imps.head(opt).index.values.tolist()
-            self.data_ = self.data_[keep]
-            self.kfold(k=k, modeler='selection', **kwargs)
-            preds = self.kfold_predictions_.copy()
-            loss_mean = ((preds['predicted'] / preds['actual']) - 1).replace(to_replace, np.nan).abs().median()
-            collection[opt] = loss_mean
+        if len(opts) > 0:
+            for opt in opts:
+                self.data_ = saved_data.copy()
+                keep = [self.yname] + imps.head(opt).index.values.tolist()
+                self.data_ = self.data_[keep]
+                self.kfold(k=k, modeler='selection', **kwargs)
+                preds = self.kfold_predictions_.copy()
+                loss_mean = ((preds['predicted'] / preds['actual']) - 1).replace(to_replace, np.nan).abs().median()
+                collection[opt] = loss_mean
+
+            keys, values = zip(*sorted(collection.items()))
+            keep_n = keys[np.argmin(np.round(values, sensitivity))]
+            imps.iloc[keep_n:, :]['keep'] = False
 
         self.data_ = saved_data.copy()
-
-        keys, values = zip(*sorted(collection.items()))
-        keep_n = keys[np.argmin(np.round(values, sensitivity))]
-
-        imps.iloc[keep_n:, :]['keep'] = False
         self.feature_importances_ = imps.copy()
 
     def filter_data(self, new_data=None):
@@ -1106,7 +1110,7 @@ class Ensemble(object):
         self.coefficients_ = boots
 
     def run(
-            self, ks=(2, 10), sensitivity=3, imp_boundary=None, predictors=None, n_inc=25, n_compare=100, n_boot=250,
+            self, ks=(2, 10), sensitivity=3, imp_boundary=None, predictors=None, n_inc=25, n_compare=100, n_boot=1,
             verbose=False):
         """
 
@@ -1123,6 +1127,7 @@ class Ensemble(object):
         """
 
         if verbose:
+            t_base = time.time()
             print 'running:',
 
         self.fit()
@@ -1152,6 +1157,7 @@ class Ensemble(object):
 
         if verbose:
             print round(time.time() - t0, 1),
+            print 'total time:', round(time.time() - t_base, 1),
             print 'finishing...'
 
 
