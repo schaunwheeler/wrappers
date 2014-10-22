@@ -890,7 +890,11 @@ class Ensemble(object):
         Args:
             k (int): number of folds
             sensitivity (int): how many decimal places should be considered
-            imp_boundary (float):
+            imp_boundary (float or int): if positive float, selection will be performed after omitting all variables
+                that have importance scores less than imp_boundary; if negative float, selection will be performed after
+                omitting all variables where 1.0 - cumsum(variables) < imp_boundary, if positive integer, selection
+                will be performed on n most important variables where n == imp_boundary; all other values will result
+                in selection being performed on all variables
             **kwargs: passed to `kfold`, which is passed to `cross_validate`, which is passed to `fit`
 
         Returns:
@@ -1023,15 +1027,16 @@ class Ensemble(object):
         if return_output:
             return (output, errors) if q is not None else errors
 
-    def simulate(self, predictors=None, n_inc=25, n_compare=100, n_boot=1):
+    def simulate(self, predictors=None, n_compare=50, n_sims=500, method=None):
         """Simulate response of outcome variable to changes in each predictor, holding everything else constant.
 
         Args:
             predictors (list, optional): list of predictors for which to calculate coefficients, all predictors in
                 `data_` used if none fed to method
-            n_inc (int): number of evenly-spaced increments in the outcome variable to use for the simulation
-            n_compare (int): number of comparisons to make for each increment
-            b_boot (int): number of bootstrap samples to use to estimate slope
+            n_sims (int): number of values to simulate from original data set
+            n_compare (int): number of error-weighted comparisons to make for each simulation
+            method (list): method(s) to use for calculating correlation; can be 'pearson', 'kendall', and/or 'spearman';
+                if None (default), only 'pearson' is used
 
         Returns:
             simulations_ (pandas.DataFrame):
@@ -1042,75 +1047,28 @@ class Ensemble(object):
 
         predictors = self.data_.drop([self.yname], axis=1).columns.values.tolist() if predictors is None else predictors
         sim_data = self.training_data_scaled_.copy()
+        sim_inds = np.random.choice(sim_data.shape[0], n_sims)
+        sim_data = sim_data.iloc[sim_inds, :]
+        sim_vals = sim_data.iloc[np.repeat(range(n_sims), n_compare), :].copy()
 
-        output_dfs = []
-        boots = []
-        n = n_compare ** 2
-        for p in predictors:
-            #print len(predictors) - predictors.index(p)
-            sims = np.linspace(sim_data[p].min(), sim_data[p].max(), n_inc)
-            others = [pred for pred in predictors if pred != p]
-            if len(others) > 0:
-                weights = [make_weights(sim_data[p], (sims < s).mean()) for s in sims]
-                other_vals = [[np.random.choice(sim_data[o], size=n_compare, p=w) for o in others] for w in weights]
-                other_vals = np.concatenate([np.column_stack(vals) for vals in other_vals], axis=0)
-                idx = pd.MultiIndex.from_tuples(others, names=self.data_.columns.names)
-                sim_vals = pd.DataFrame(other_vals, columns=idx)
-                sim_vals[p] = sims.tolist() * n_compare
-            else:
-                sim_vals = pd.DataFrame()
-                sim_vals[p] = sims.tolist() * n_compare
-                sim_vals.columns = pd.MultiIndex.from_tuples([p], names=self.data_.columns.names)
+        preds = pd.Series(index=range(sim_data.shape[0]))
+        preds.loc[:] = self.validation_modeler.predict(sim_data.drop([self.yname], axis=1))
+        cv_preds = self.kfold_predictions_.copy()
+        preds = self.empirical_error(preds, cv_preds['predicted'], cv_preds['actual'], n=n_compare).unstack()
+        sim_vals[self.yname] = preds.values
 
-            sim_vals = sim_vals[predictors]
-            sim_vals = sim_vals.sort([p])
+        methods = ['pearson'] if method is None else method
+        output = pd.DataFrame(index=predictors)
+        for m in methods:
+            output[m] = pd.concat([sim_vals[[p, self.yname]].corr(m).iloc[[0], [-1]] for p in predictors])
+        output['importance'] = self.feature_importances_['value']
+        output = output.sort('importance', ascending=False)
 
-            predictor = sim_vals[p].copy()
-            preds = pd.Series(index=sim_vals.index)
-            preds.loc[:] = self.validation_modeler.predict(sim_vals)
-            cv_preds = self.kfold_predictions_.copy()
-            preds = self.empirical_error(preds, cv_preds['predicted'], cv_preds['actual'], n=n_compare).stack()
-            predictor = predictor.iloc[range(predictor.shape[0]) * n_compare]
-
-            boot_output = pd.Series()
-            pearson = 0
-            kendall = 0
-            for i in range(n_boot):
-                resample = np.random.choice(predictor.shape[0], n)
-                corrdata = pd.DataFrame()
-                corrdata['x'] = predictor.values[resample]
-                corrdata['y'] = preds.values[resample]
-                pearson += corrdata.corr('pearson').iloc[0, -1]
-                kendall += corrdata.corr('kendall').iloc[0, -1]
-            boot_output['pearson'] = pearson / n_boot
-            boot_output['kendal'] = kendall / n_boot
-
-            if all([type(x) == pd.Series for x in self.scaler.values()]):
-                preds = (preds * self.scaler['std'][self.yname]) + self.scaler['mean'][self.yname]
-                predictor = (predictor * self.scaler['std'][p]) + self.scaler['mean'][p]
-            output = pd.DataFrame()
-            output['outcome'] = preds.values
-            output['value'] = predictor.values
-            index_names = sim_vals.columns.names + ['increment', 'simulation']
-            increment = np.tile(range(n_inc), n_compare**2)
-            simulation = np.repeat(range(n_compare**2), n_inc)
-            output_index = [p + (increment[j], ) + (simulation[j], ) for j in range(len(increment))]
-            output_index = pd.MultiIndex.from_tuples(output_index, names=index_names)
-            output.index = output_index
-
-            output_dfs.append(output.copy())
-            boots.append(boot_output.copy())
-
-        output_dfs = pd.concat(output_dfs, axis=0)
-        boots = pd.concat(boots, axis=1, keys=predictors).T
-        boots.index = pd.MultiIndex.from_tuples(boots.index.values, names=self.data_.columns.names)
-        boots['importance'] = self.feature_importances_[self.feature_importances_['keep']]['value']
-
-        self.simulations_ = output_dfs
-        self.coefficients_ = boots
+        self.simulations_ = sim_vals
+        self.coefficients_ = output
 
     def run(
-            self, ks=(2, 10), sensitivity=3, imp_boundary=None, predictors=None, n_inc=25, n_compare=100, n_boot=1,
+            self, ks=(2, 10), sensitivity=2, imp_boundary=None, predictors=None, n_sims=500, n_compare=50,
             verbose=False):
         """
 
@@ -1153,7 +1111,7 @@ class Ensemble(object):
             print 'simulating...',
             t0 = time.time()
 
-        self.simulate(predictors=predictors, n_inc=n_inc, n_compare=n_compare, n_boot=n_boot)
+        self.simulate(predictors=predictors, n_sims=n_sims, n_compare=n_compare)
 
         if verbose:
             print round(time.time() - t0, 1),
