@@ -816,7 +816,7 @@ class Ensemble(object):
 
         self.predictions_ = model_preds
 
-    def crossvalidate(self, fold_index, ahead=None, modeler='validation', **kwargs):
+    def crossvalidate(self, fold_index, ahead=None, modeler='validation'):
         """Given an array of inclusion/exclusion flags, train a model, fit predictons to new data.
 
         Args:
@@ -843,12 +843,12 @@ class Ensemble(object):
             test = test.iloc[[ahead], :]
 
         self.data_ = train
-        self.fit(modeler=modeler, **kwargs)
+        self.fit(modeler=modeler)
         self.predict(test, modeler=modeler)
         self._load_state()
         return copy.deepcopy(self)
 
-    def kfold(self, k=10, modeler='validation', **kwargs):
+    def kfold(self, k=10, modeler='validation'):
         """Perform cross-validation on k randomly-partitioned sections of self.data_
 
         Args:
@@ -877,25 +877,27 @@ class Ensemble(object):
             fold_indices = [folds != fold for fold in np.unique(folds)]
             ahead = None
 
-        fold_list = [self.crossvalidate(idx, ahead=ahead, modeler=modeler, **kwargs) for idx in fold_indices]
+        fold_list = [self.crossvalidate(idx, ahead=ahead, modeler=modeler) for idx in fold_indices]
 
         self.kfold_results_ = fold_list
         preds = pd.concat([x.predictions_ for x in self.kfold_results_])
         self.kfold_predictions_ = preds.copy()
 
-    def select_features(self, k=2, sensitivity=2, imp_boundary=None, **kwargs):
+    def select_features(self, k=2, sensitivity=2, auto_filter=None, smooth=True, use_max=True, level_off=True):
         """Select features based on k-fold cross validation, using median absolute percent error weighted by pearson
          correlatino coefficient as a loss function
 
         Args:
             k (int): number of folds
-            sensitivity (int): how many decimal places should be considered
-            imp_boundary (float or int): if positive float, selection will be performed after omitting all variables
-                that have importance scores less than imp_boundary; if negative float, selection will be performed after
-                omitting all variables where 1.0 - cumsum(variables) < imp_boundary, if positive integer, selection
-                will be performed on n most important variables where n == imp_boundary; all other values will result
+            sensitivity (int): how many decimal places should be considered meaninful when comparing loss function
+            auto_filter (float or int): if positive float, selection will be performed after omitting all variables
+                that have importance scores less than auto_filter; if negative float, selection will be performed after
+                omitting all variables where 1.0 - cumsum(variables) < auto_filter, if positive integer, selection
+                will be performed on n most important variables where n == auto_filter; all other values will result
                 in selection being performed on all variables
-            **kwargs: passed to `kfold`, which is passed to `cross_validate`, which is passed to `fit`
+            smooth (bool): use exponentially-weighted moving average to smooth loss function results
+            use_max (bool): use a moving maximum to smooth loss function results
+            level_off (bool): choose optimum number of features based on the curve leveling off, rather than raw minimum
 
         Returns:
             None: 'keep' column of `feature_importances_` is ammended to only be True for selected variables
@@ -907,59 +909,63 @@ class Ensemble(object):
         to_replace = [np.inf, -np.inf, 0.]
         min_n = 1
 
-        if type(imp_boundary) == int:
-            max_n = imp_boundary if imp_boundary <= imps.shape[0] else imps.shape[0]
-        elif imp_boundary < 0:
+        if auto_filter is None:
+            max_n = imps.shape[0]
+        elif type(auto_filter) == int:
+            max_n = auto_filter if auto_filter <= imps.shape[0] else imps.shape[0]
+        elif auto_filter < 0:
             vals = imps['value']
             vals = [vals.iloc[i:].sum() for i in range(vals.shape[0])]
-            max_n = (np.array(vals) > -imp_boundary).sum()
-        elif imp_boundary > 0:
+            max_n = (np.array(vals) > -auto_filter).sum()
+        elif auto_filter > 0:
             max_n = (imps['value'] > imp_boundary).sum()
         else:
             max_n = imps.shape[0]
 
-        if max_n > min_n:
-            opts = np.unique(np.linspace(min_n, max_n, int(np.sqrt(max_n - min_n))).astype('int')).tolist()
-        else:
-            max_n = int(np.log(imps.shape[0]))
-            opts = np.unique(np.linspace(min_n, max_n, max_n).astype('int')).tolist()
-        collection = {}
+        max_n = max_n if max_n > min_n else int(np.sqrt(imps.shape[0]))
+        skip = int(np.ceil(np.sqrt(max_n - min_n)))
+
         saved_data = self.data_.copy()
 
-        while (max(opts) - min(opts)) > 8:
-            ns = []
+        opts = range(min_n, max_n, skip)
+        losses = pd.Series(index=opts)
+        while len(opts) > 0:
             for opt in opts:
+                print opt,
                 self.data_ = saved_data.copy()
                 keep = [self.yname] + imps.head(opt).index.values.tolist()
                 self.data_ = self.data_[keep]
-                self.kfold(k=k, modeler='selection', **kwargs)
+                self.kfold(k=k, modeler='selection')
                 preds = self.kfold_predictions_.copy()
-                loss_mean = ((preds['predicted'] / preds['actual']) - 1).replace(to_replace, np.nan).abs().median()
-                loss_corr = preds.corr().iloc[0, -1]
-                loss_corr = loss_corr if loss_corr > 0.0 else 1.7976931348623157e-308
-                collection[opt] = loss_mean / loss_corr
-                ns.append(loss_mean)
-            ind = (np.round(ns, sensitivity) == np.round(ns, sensitivity).min()).argmax()
-            min_n = min_n + 1 if ind == 0 else opts[ind - 1] + 1
-            max_n = max_n - 1 if ind == (len(opts) - 1) else opts[ind + 1] - 1
-            opts = np.unique(np.linspace(min_n, max_n, int(np.sqrt(max_n - min_n))).astype('int')).tolist()
-            #print sorted(collection.keys())
+                loss_val = ((preds['predicted'] / preds['actual']) - 1).replace(to_replace, np.nan).abs().median()
+                losses[opt] = loss_val
+            losses = losses.sort_index()
+            anchors = losses.iloc[1:][losses.iloc[1:].round(sensitivity).diff().shift(-1) > 0.0].index.values
+            pool = losses.index.values.tolist()
+            opts = []
+            for a in anchors:
+                i = pool.index(a)
+                start_i = i - 1
+                end_i = i + 1
+                prange = range(pool[start_i] + 1, pool[i]) + range(pool[i] + 1, pool[end_i])
+                n = int(np.ceil(np.sqrt(len(prange))))
+                if len(prange) > 1:
+                    opts += np.random.choice(prange, n, replace=False).tolist()
+            opts = [x for x in opts if x not in losses.index.values]
+            opts = sorted(opts)
 
-        opts = [x for x in range(min_n, max_n + 1) if x not in collection.keys()]
+        losses = losses.reindex_like(pd.Series(index=range(min_n, max_n + 1))).interpolate()
+        if smooth:
+            losses = pd.ewma(losses, 3)
+        if use_max:
+            losses = pd.rolling_max(losses, 3, center=True)
 
-        if len(opts) > 0:
-            for opt in opts:
-                self.data_ = saved_data.copy()
-                keep = [self.yname] + imps.head(opt).index.values.tolist()
-                self.data_ = self.data_[keep]
-                self.kfold(k=k, modeler='selection', **kwargs)
-                preds = self.kfold_predictions_.copy()
-                loss_mean = ((preds['predicted'] / preds['actual']) - 1).replace(to_replace, np.nan).abs().median()
-                collection[opt] = loss_mean
+        if level_off:
+            keep_n = (losses.round(sensitivity).diff() >= 0.0).argmax()
+        else:
+            keep_n = losses.round(sensitivity).argmin()
 
-            keys, values = zip(*sorted(collection.items()))
-            keep_n = keys[np.argmin(np.round(values, sensitivity))]
-            imps.iloc[keep_n:, :]['keep'] = False
+        imps.iloc[keep_n:, :]['keep'] = False
 
         self.data_ = saved_data.copy()
         self.feature_importances_ = imps.copy()
@@ -1068,15 +1074,14 @@ class Ensemble(object):
         self.coefficients_ = output
 
     def run(
-            self, ks=(2, 10), sensitivity=2, imp_boundary=None, predictors=None, n_sims=500, n_compare=50,
-            verbose=False):
+            self, ks=(5, 10), sensitivity=2, auto_filter=None, smooth=True, use_max=True, level_off=True,
+            predictors=None, n_sims=500, n_compare=50, verbose=False):
         """
 
         Args:
             ks (tuple): length 2, first element fet to `select_features`, second to `kfold`
             minimum (int): passed to `select_features`
             scaler (float): passed to `select_features`
-            **kwargs: passed to `simulate`
 
         Returns:
             None
@@ -1094,7 +1099,9 @@ class Ensemble(object):
             print 'selecting...',
             t0 = time.time()
 
-        self.select_features(k=ks[0], sensitivity=sensitivity, imp_boundary=imp_boundary)
+        self.select_features(
+            k=ks[0], sensitivity=sensitivity, auto_filter=auto_filter, smooth=smooth, use_max=use_max,
+            level_off=level_off)
         self.filter_data()
 
         if verbose:
