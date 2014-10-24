@@ -883,7 +883,7 @@ class Ensemble(object):
         preds = pd.concat([x.predictions_ for x in self.kfold_results_])
         self.kfold_predictions_ = preds.copy()
 
-    def select_features(self, k=2, sensitivity=2, auto_filter=None, smooth=True, use_max=True, level_off=True):
+    def select_features(self, k=5, sensitivity=2, auto_filter=None, smooth=True, use_max=True, level_off=True):
         """Select features based on k-fold cross validation, using median absolute percent error weighted by pearson
          correlatino coefficient as a loss function
 
@@ -931,7 +931,7 @@ class Ensemble(object):
         losses = pd.Series(index=opts)
         while len(opts) > 0:
             for opt in opts:
-                print opt,
+                #print opt,
                 self.data_ = saved_data.copy()
                 keep = [self.yname] + imps.head(opt).index.values.tolist()
                 self.data_ = self.data_[keep]
