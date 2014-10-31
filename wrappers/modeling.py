@@ -267,8 +267,7 @@ def bulk_linear_impute(y, x=None, poly=None, log=False):
 
     """
 
-
-    nulls = y.isnull().multiply(y.index.values, axis=0).mean()
+    nulls = y.isnull().multiply(np.arange(1, y.shape[0]+1), axis=0).std()
     null_vals = nulls[nulls > 0.].unique()
 
     for null_val in null_vals:
@@ -277,7 +276,7 @@ def bulk_linear_impute(y, x=None, poly=None, log=False):
         if x is not None:
             x_use = x.copy()
         else:
-            x_use = y.index.values
+            x_use = np.arange(y.shape[0])
         if log:
             y_use = np.log(y_use+1)
         to_test = (y_use.isnull().sum(axis=1) > 0.0).values
@@ -315,14 +314,17 @@ def bulk_lag_estimate(y, shift, x=None, poly=None, log=False):
     """
 
     y_use = y.copy()
+    zeros = (y_use == 0.0).values
+    np.place(y_use.values, zeros, np.abs(np.random.normal(0.0, 0.0000000001, zeros.sum())))
+
     if x is not None:
         x_use = x.copy()
     else:
-        x_use = y.index.values
+        x_use = np.arange(y.shape[0])
     if log:
         y_use = np.log(y_use+1)
     train = pd.DataFrame({'x': x_use})
-    target = x_use.max()+shift
+    target = x_use.max() + shift
     test = pd.DataFrame({'x': [target]})
     if poly is not None:
         for p in poly:
@@ -334,7 +336,7 @@ def bulk_lag_estimate(y, shift, x=None, poly=None, log=False):
         out = np.exp(out) - 1
 
     out = pd.Series(out, index=y.columns)
-    out.name = target
+    out.name = target - shift
 
     return out
 
@@ -358,11 +360,14 @@ class MarketSizes(object):
 
     """
 
-    def __init__(self, conn):
+    def __init__(self, conn, years=None, forecasts=False, ppp=False):
         """Establish database connection and load some data for later use
 
         Args:
             conn (sqlalchemy.engine.base.Engine): a database engine created through SQLAlchemy
+            years (list): list of years to pull
+            forecasts (bool): whether to includes years where data is a Euromonitor estimate
+            ppp (bool): whether to multiply RSP and MSP values by purchasing power parity factor
 
         Attributes:
             countries_ (pandas.DataFrame): country id (iso3) and name
@@ -370,40 +375,15 @@ class MarketSizes(object):
             country_dict (dict): dictionary to map country ids to names
             category_dict (dict): dictionary to map category ids to names
             data_ (pandas.DataFrame): placeholder for data
-            lagged (dict): container for lagged data sets
-            extrapolated (dict): container for extrapolated data sets
-            staging_data_ (pandas.DataFrame): lagged and reshaped data, ready for analysis
 
-
-        """
-        self.conn = conn
-        self.countries_ = pd.read_sql('SELECT iso3 AS id, name FROM countries_country', conn)
-        self.country_dict = self.countries_.set_index('id')['name'].to_dict()
-        self.categories_ = pd.read_sql('SELECT id, name FROM industries_emcategory', conn)
-        self.category_dict = self.categories_.set_index('id')['name'].to_dict()
-        self.data_ = pd.DataFrame()
-        self.lagged = {}
-        self.extrapolated = {}
-        self.staging_data_ = pd.DataFrame()
-
-    def get_data(self, years=None, forecasts=False, silent=True):
-        """Load Euromonitor Market Sizes data and some other metrics.
-
-        Args:
-            years (list): list of years to pull
-            forecasts (boolean): whether to includes years where data is a Euromonitor estimate
-            silent (boolean): whether to return dataframe containing data
-
-        Returns:
-            nothing if silent==True. Data will be put in data_ attribute.
-            Data has following columns:
+            data_ has following columns:
                 country_id: iso3 code
                 year: year
                 category_id: euromonitor category id
                 type: category type (on-trade, off-trade, foodservice, etc.)
                 gdp_ppp: GDP at purchasing power parity (from WorldBank)
                 gdp_percapita: GDP per capita (from WorldBank)
-                spend_total: total constant 2011 dollars spent on category within country/year combination
+                spend_total: total spent on category within country/year combination, weighted by PPP conversion factor
                 population: total population (from UN)
                 spend_percapita: spend total divided by population
                 spend_share: spend_total divided by sum of spend total of top-level categories after omiting
@@ -411,6 +391,17 @@ class MarketSizes(object):
 
 
         """
+
+        self.conn = conn
+        self.countries_ = pd.read_sql('SELECT iso3 AS id, name FROM countries_country', conn)
+        self.country_dict = self.countries_.set_index('id')['name'].to_dict()
+        self.categories_ = pd.read_sql('SELECT id, name FROM industries_emcategory', conn)
+        self.keep_categories_ = pd.read_sql(
+            "SELECT id FROM industries_emcategory WHERE industry_id IS NOT NULL AND leaf = 't';",
+            conn).squeeze().values.tolist()
+        self.category_dict = self.categories_.set_index('id')['name'].to_dict()
+        self.data_ = pd.DataFrame()
+
 
         # format years for inclusion in SQL statement
         years = range(1950, 2050) if years is None else years
@@ -421,7 +412,7 @@ class MarketSizes(object):
         countries = ', '.join([repr(x) for x in countries])
 
         # format WorldBank variables for inclusion in SQL statement
-        variables = ['NY_GDP_PCAP_PP_KD', 'NY_GDP_MKTP_PP_KD']
+        variables = ['NY_GDP_PCAP_PP_KD', 'NY_GDP_MKTP_PP_KD', 'PA_NUS_PPP']
         variables = ', '.join([repr(x) for x in variables])
 
         marketsizes = pd.read_sql(
@@ -430,32 +421,16 @@ class MarketSizes(object):
                 ms.country_id,
                 ms.year,
                 ms.emcategory_id as category_id,
-                type.name as type,
+                ms.type_id,
                 ms.first_forecast,
-                /*ms.type_id,*/
-                /*ms.fx_id,*/
-                /*ms.price_id,*/
-                /*ms.unit_id,*/
-                ms.size * (fx.value / fxbaseline.value) * 1000000 as spend_total
-            FROM industries_marketsize as ms
-            LEFT JOIN countries_countrydata AS fx
-                ON ms.country_id = fx.country_id
-                AND ms.year = fx.year
-                AND fx.indicator_id = 'fx'
-            LEFT JOIN countries_countrydata AS fxbaseline
-                ON ms.country_id = fxbaseline.country_id
-                AND fxbaseline.year = 2011
-                AND fxbaseline.indicator_id = 'fx'
-            LEFT JOIN industries_type AS type
-                ON ms.type_id = type.id
+                ms.fx_id,
+                ms.price_id,
+                ms.unit_id,
+                ms.size * 1000000 as spend_total
+            FROM industries_marketsize AS ms
             WHERE ms.size IS NOT NULL
-                AND fx.value IS NOT NULL
-                AND fxbaseline.value IS NOT NULL
-                AND ms.fx_id=1
-                AND ms.unit_id=10
-                AND ms.type_id IN (3, 9, 10, 11, 12, 13)
-                AND ms.country_id NOT IN ({c})
-                AND ms.year IN ({y});
+            AND ms.country_id NOT IN ({c})
+            AND cast(ms.year as int) IN ({y});
             '''.format(y=years, c=countries), self.conn)
 
         population = pd.read_sql(
@@ -466,7 +441,7 @@ class MarketSizes(object):
                 SUM(people)*1000 AS value
             FROM countries_population
             WHERE country_id NOT IN ({c})
-                AND year IN ({y})
+                AND cast(year as int) IN ({y})
             GROUP BY country_id, year;
             '''.format(y=years, c=countries), self.conn)
         population['indicator_id'] = 'population'
@@ -474,14 +449,16 @@ class MarketSizes(object):
         features = pd.read_sql(
             '''
             SELECT
-              country_id,
-              year,
-              indicator_id,
+              d.country_id,
+              d.year,
+              c.code AS indicator_id,
               value
-            FROM countries_countrydata
-            WHERE country_id NOT IN ({c})
-              AND indicator_id IN ({v})
-              AND year IN ({y});
+            FROM countries_data as d
+            LEFT JOIN countries_datacatalog as c
+            ON d.variable_id = c.id
+            WHERE d.country_id NOT IN ({c})
+              AND c.code IN ({v})
+              AND cast(d.year as int) IN ({y});
             '''.format(y=years, c=countries, v=variables), self.conn)
         features = pd.concat([features, population])
         features = features.set_index(['country_id', 'year', 'indicator_id'])
@@ -492,10 +469,19 @@ class MarketSizes(object):
         features2 = bulk_linear_impute(features, poly=[2], log=True)
         features = (features1 + features2) / 2.0
         features = features.stack('country_id').reset_index()
-        features = features.rename(columns={'NY_GDP_MKTP_PP_KD': 'gdp_ppp', 'NY_GDP_PCAP_PP_KD': 'gdp_percapita'})
+        features = features.rename(columns={
+            'NY_GDP_MKTP_PP_KD': 'gdp_ppp', 'NY_GDP_PCAP_PP_KD': 'gdp_percapita', 'PA_NUS_PPP': 'ppp_factor'})
 
         # Merge demographic data with marketsizes data
         data = pd.merge(marketsizes, features, how='left', on=['year', 'country_id'])
+        data['ppp_factor'] = data['ppp_factor'].fillna(1.0)
+
+        if ppp:
+            keep_ppp = data['type_id'].isin([
+                'val_rsp_on', 'val_afh_msp', 'val_msp', 'val_msp_off', 'val_msp_on', 'val_msp_retail', 'val_rsp',
+                'val_rsp_fs', 'val_rsp_net', 'val_rsp_off', 'val_rsp_retail'])
+            data.loc[~keep_ppp, 'ppp_factor'] = 1.0
+            data['spend_total'] = data['spend_total'] * data['ppp_factor']
 
         # Calculate alternative consumption measures
         data['spend_percapita'] = data['spend_total'] / data['population']
@@ -504,14 +490,13 @@ class MarketSizes(object):
         def calc_spend_share(df):
             """Calculate spend share by omitting on/off-trade distinctions from top-level categories"""
 
-            ontrade = df['type'].str.contains('^On-trade')
-            offtrade = df['type'].str.contains('^Off-trade')
             firstlevel = df['category_id'].str.endswith('-00-00-00-00-00-00')
-            share = df['spend_total'] / df[~ontrade & ~offtrade & firstlevel]['spend_total'].sum()
+            share = df['spend_total'] / df[firstlevel]['spend_total'].sum()
             share[share == np.inf] = 0.0
             return share
 
-        grp = data.groupby(['country_id', 'year'], group_keys=False, sort=False, squeeze=True)
+        group_cols = ['country_id', 'year', 'type_id', 'unit_id', 'fx_id', 'price_id']
+        grp = data.groupby(group_cols, group_keys=False, sort=False, squeeze=True)
         data['spend_share'] = grp.apply(calc_spend_share)
 
         if not forecasts:
@@ -520,10 +505,38 @@ class MarketSizes(object):
 
         self.data_ = data.copy()
 
-        if not silent:
-            return data.copy()
 
-    def lag(self, index, metrics, time, shift, silent=True):
+class DataHandler(object):
+    """Class to load and manipulate data.
+
+
+    """
+
+    def __init__(self, data, time, index, metrics):
+        """Load the data
+
+        Args:
+            data (pandas.DataFrame): data to manipulate
+            index (list): columns of self.data_ to use to form a unique index
+            metrics (list): columns of self.data_ for which to create lagged versions
+
+        Attributes:
+            data_ (pandas.DataFrame): placeholder for data
+            lagged (dict): container for lagged data sets
+            extrapolated (dict): container for extrapolated data sets
+            staging_data_ (pandas.DataFrame): lagged and reshaped data, ready for analysis
+
+
+        """
+        self.data_ = data.copy()
+        self.index = index
+        self.time = time
+        self.metrics = metrics
+        self.lagged = {}
+        self.extrapolated = {}
+        self.staging_data_ = pd.DataFrame()
+
+    def lag(self, shift, time=None, index=None, metrics=None, yvars=None, silent=True):
         """Align lagged data with dataframe.
 
         Args:
@@ -539,30 +552,46 @@ class MarketSizes(object):
 
         """
 
+        index = self.index if index is None else index
+        metrics = self.metrics if metrics is None else metrics
+        time = self.time if time is None else time
+
         df = self.data_.copy()
+        metrics = df.drop(time + index, axis=1).columns.values.tolist() if metrics is None else metrics
         side_columns = [x for x in df.columns if x not in (index + metrics)]
         df = df.set_index(index)
         reserve = df[side_columns]  # hold out for later
         df = df.drop(side_columns, axis=1)
         df = df.stack()
-        df.index.names = ['metric' if x is None else x for x in df.index.names]
+        metric_name = 'metric' if None in df.index.names else [x for x in df.index.names if x not in index][0]
+        df.index.names = [metric_name if x is None else x for x in df.index.names]
         df = df.unstack([x for x in df.index.names if x not in time])
-        df = pd.concat([df, df.shift(shift)], keys=[0, shift], names=['lag', 'year'])
-        df = df.stack([x for x in df.columns.names if x != 'metric']).unstack('lag')
-        df.columns = df.columns.reorder_levels(['lag', 'metric'])
+        df_shift = df.shift(shift).copy()
+        df = pd.concat([df, df_shift], keys=[0, shift], names=['lag'] + time)
+        df.columns.names = [metric_name] if df.columns.names == [None] else df.columns.names
+        df = df.T.stack(df.index.names).unstack(['lag', metric_name])
+
+        if type(df.columns) == pd.MultiIndex:
+            df.columns = df.columns.reorder_levels(['lag', metric_name])
         df = df.T.sort_index().T
-        df.index = df.index.reorder_levels(index)
-        reserve.index = reserve.index.reorder_levels(index)
+        if type(df.index) == pd.MultiIndex:
+            df.index = df.index.reorder_levels(reserve.index.names)
+            reserve.index = reserve.index.reorder_levels(reserve.index.names)
         reserve.columns = [(0, x) for x in reserve.columns]
         dropna_cols = df.columns.values
-        df = pd.concat([df, reserve], axis=1)
+        if min(reserve.shape) > 0:
+            df = pd.concat([df, reserve], axis=1)
         df = df.dropna(subset=dropna_cols)
-        df.columns = pd.MultiIndex.from_tuples(df.columns, names=['lag', 'metric'])
+        df.columns = pd.MultiIndex.from_tuples(df.columns, names=['lag', metric_name])
+        if yvars is not None:
+            drop_cols = [(0, x) for x in metrics if x not in yvars]
+            keep_cols = [x for x in df.columns.values if x not in drop_cols]
+            df = df[keep_cols]
         self.lagged[shift] = df.copy()
         if not silent:
             return df.copy()
 
-    def extrapolate(self, index, metrics, time, shift, silent=True):
+    def extrapolate(self, shift, time=None, index=None, metrics=None, silent=True):
         """Create simple linear predictions at a specified time horizon.
 
         Args:
@@ -578,13 +607,19 @@ class MarketSizes(object):
 
         """
 
+        index = self.index if index is None else index
+        metrics = self.metrics if metrics is None else metrics
+        time = self.time if time is None else time
+
         df = self.data_.copy()
+        metrics = df.columns.values.tolist() if metrics is None else metrics
         side_columns = [x for x in df.columns if x not in (index + metrics)]
         df = df.set_index(index)
         reserve = df[side_columns]  # hold out for later
         df = df.drop(side_columns, axis=1)
         df = df.stack()
-        df.index.names = ['metric' if x is None else x for x in df.index.names]
+        metric_name = 'metric' if None in df.index.names else [x for x in df.index.names if x not in index][0]
+        df.index.names = [metric_name if x is None else x for x in df.index.names]
         df = df.unstack([x for x in df.index.names if x not in time])
 
         # impute missing values (extrapolation can't handle them)
@@ -594,6 +629,7 @@ class MarketSizes(object):
         dfi2 = bulk_linear_impute(df, poly=None, log=True)
         df = (dfi1 + dfi2) / 2.0
         df[df < 0.0] = 0.0
+        df = df.replace([np.inf, -np.inf, np.nan], 0.0)
 
         # extrapolate in any cases where we have at least three years
         df_years = df.index.values[2:]
@@ -604,24 +640,28 @@ class MarketSizes(object):
         df2 = pd.concat(df2, axis=1).T
         df_pred = (df1 + df2) / 2.0
         df_pred[df_pred < 0.0] = 0.0
+        df_pred.index = df.iloc[df_pred.index.values, 0].index + shift
 
         df = pd.concat([df, df_pred], keys=[0, shift], names=['forecast', 'year'])
-        df = df.stack([x for x in df.columns.names if x != 'metric']).unstack('forecast')
-        df.columns = df.columns.reorder_levels(['forecast', 'metric'])
+        df = df.T.stack(df.index.names).unstack(['forecast', metric_name])
+        if type(df.columns) == pd.MultiIndex:
+            df.columns = df.columns.reorder_levels(['forecast', metric_name])
         df = df.T.sort_index().T
-        df.index = df.index.reorder_levels(index)
-        reserve.index = reserve.index.reorder_levels(index)
+        if type(df.index) == pd.MultiIndex:
+            df.index = df.index.reorder_levels(reserve.index.names)
+            reserve.index = reserve.index.reorder_levels(reserve.index.names)
         reserve.columns = [(0, x) for x in reserve.columns]
         dropna_cols = df.columns.values
-        df = pd.concat([df, reserve], axis=1)
+        if reserve.shape[0] > 0:
+            df = pd.concat([df, reserve], axis=1)
         df = df.dropna(subset=dropna_cols)
-        df.columns = pd.MultiIndex.from_tuples(df.columns, names=['forecast', 'metric'])
+        df.columns = pd.MultiIndex.from_tuples(df.columns, names=['forecast', metric_name])
         self.extrapolated[shift] = df.copy()
 
         if not silent:
             return df.copy()
 
-    def reshape(self, lag, target, rows, predictors, category, threshold=0.1, silent=True):
+    def reshape(self, lag, target, rows, category, predictors=None, threshold=0.1, silent=True):
         """
         Args:
             lag (str or int): key of output of calling `self.lag`; use a negative value to create test data
@@ -635,24 +675,42 @@ class MarketSizes(object):
 
         """
 
+        if np.abs(lag) not in self.lagged.keys():
+            self.lag(shift=np.abs(lag))
+
+        predictors = self.metrics if predictors is None else predictors
+
         lagger = lag if lag > 0 else 0
-        df = self.lagged[lagger].copy() if lag > 0 else self.lagged.values()[0]
+        df = self.lagged[lagger].copy()
+
+        if lag < 0:
+            present_cols = [(0, m) for m in self.metrics]
+            lagged_cols = [(lagger, m) for m in self.metrics]
+            df.loc[:, lagged_cols] = df[present_cols].values
+
         pivot_columns = [x for x in df.index.names if x not in rows]
         df_target = df.copy()
         for key, val in category.items():
             df_target = df_target.xs(val, level=key, drop_level=False)
-        df_target = df_target[[(0, target)]].unstack(pivot_columns)
-        new_cols = [(-1,) + x[1:] for x in df_target.columns.values]
-        df_target.columns = pd.MultiIndex.from_tuples(new_cols, names=df_target.columns.names)
+        df_target = df_target[(0, target)].unstack(pivot_columns)
+        if type(df_target.columns) == pd.MultiIndex:
+            new_cols = [(-1, target,) + x for x in df_target.columns.values]
+        else:
+            new_cols = [(-1, target, x) for x in df_target.columns.values]
+        df_target.columns = pd.MultiIndex.from_tuples(new_cols, names=['lag', 'metric'] + df_target.columns.names)
         pred_columns = [(lagger, x) for x in predictors]
-        df_match = df[pred_columns].unstack(pivot_columns)
-        empties = (df_match.isnull().mean() == 1.0).values
+        df_match = pd.concat(
+            [df[p].unstack(pivot_columns) for p in pred_columns],
+            axis=1, keys=pred_columns, names=['lag', 'metric'])
+        empties = (df_match.isnull().mean() >= (1.0 - threshold)).values
         df_match = df_match.loc[:, ~empties]
         keep = df_match.notnull().mean(axis=1) >= threshold
         df_match = df_match.loc[keep, :]
+        empties = (df_match.isnull().mean() >= (1.0 - threshold)).values
+        df_match = df_match.loc[:, ~empties]
         df_match = df_match.fillna(0.0)
         df = pd.merge(df_target, df_match, how='left', left_index=True, right_index=True)
-        final_cols = [(np.abs(lag),) + x[1:] if x[0]!=-1 else x for x in df.columns.values]
+        final_cols = [(np.abs(lag),) + x[1:] if x[0] != -1 else x for x in df.columns.values]
         df.columns = pd.MultiIndex.from_tuples(final_cols, names=df.columns.names)
         self.staging_data_ = df.copy()
 
